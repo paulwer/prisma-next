@@ -24,6 +24,7 @@ import {
   type MongoMigrationPlanOperation,
 } from '@prisma-next/mongo-query-ast/control';
 import type { MongoQueryPlan } from '@prisma-next/mongo-query-ast/execution';
+import { ifDefined } from '@prisma-next/utils/defined';
 import type { CollModMeta } from './op-factory-call';
 
 interface Buildable {
@@ -50,6 +51,12 @@ const MATCH_ALL_FILTER: MongoFilterExpr = MongoExistsExpr.exists('_id');
 export function dataTransform(
   name: string,
   options: {
+    /**
+     * Optional opt-in routing identity. Presence opts the transform into
+     * invariant-aware routing; absence means it is path-dependent and
+     * not referenceable from refs.
+     */
+    invariantId?: string;
     check?: {
       source: () => MongoQueryPlan | Buildable;
       filter?: MongoFilterExpr;
@@ -81,6 +88,7 @@ export function dataTransform(
     label: `Data transform: ${name}`,
     operationClass: 'data',
     name,
+    ...ifDefined('invariantId', options.invariantId),
     precheck,
     run,
     postcheck,

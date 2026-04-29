@@ -37,6 +37,7 @@ import type {
 } from '@prisma-next/framework-components/control';
 import type { SqlStorage } from '@prisma-next/sql-contract/types';
 import type { SqlQueryPlan } from '@prisma-next/sql-relational-core/plan';
+import { ifDefined } from '@prisma-next/utils/defined';
 
 interface Buildable<R = unknown> {
   build(): SqlQueryPlan<R>;
@@ -49,6 +50,12 @@ interface Buildable<R = unknown> {
 export type DataTransformClosure = () => SqlQueryPlan | Buildable;
 
 export interface DataTransformOptions {
+  /**
+   * Optional opt-in routing identity. Presence opts the transform into
+   * invariant-aware routing; absence means it is path-dependent and
+   * not referenceable from refs.
+   */
+  readonly invariantId?: string;
   /** Optional pre-flight query. `undefined` means "no check". */
   readonly check?: DataTransformClosure;
   /** One or more mutation queries to execute. */
@@ -76,6 +83,7 @@ export function dataTransform<TContract extends Contract<SqlStorage>>(
     label: `Data transform: ${name}`,
     operationClass: 'data',
     name,
+    ...ifDefined('invariantId', options.invariantId),
     source: 'migration.ts',
     check: options.check ? invokeAndLower(options.check, contract, adapter, name) : null,
     run: runClosures.map((closure) => invokeAndLower(closure, contract, adapter, name)),
