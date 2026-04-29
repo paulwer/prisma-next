@@ -1,1 +1,1 @@
-export { parseContractMarkerRow, readMarker, readMarkerSql } from '../core/verify';
+export { type ContractMarkerRow, parseContractMarkerRow } from '../core/verify';

@@ -1,7 +1,8 @@
 import { INIT_ADDITIVE_POLICY } from '@prisma-next/family-sql/control';
-import { readMarker } from '@prisma-next/family-sql/verify';
+import { emptyCodecLookup } from '@prisma-next/framework-components/codec';
 import type { PostgresPlanTargetDetails } from '@prisma-next/target-postgres/planner-target-details';
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from 'vitest';
+import { PostgresControlAdapter } from '../../src/core/control-adapter';
 import {
   contract,
   createDriver,
@@ -193,8 +194,9 @@ describe.sequential('PostgresMigrationRunner - Basic Execution', () => {
           operations: [],
         });
 
+        const adapter = new PostgresControlAdapter(emptyCodecLookup);
         const readInvariants = async (): Promise<readonly string[]> => {
-          const marker = await readMarker(driver!);
+          const marker = await adapter.readMarker(driver!);
           return marker?.invariants ?? [];
         };
 
