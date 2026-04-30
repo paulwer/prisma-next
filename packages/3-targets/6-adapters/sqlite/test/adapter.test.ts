@@ -263,10 +263,19 @@ describe('SQLite adapter', () => {
     it('renders RETURNING', () => {
       const ast = InsertAst.into(TableSource.named('user'))
         .withRows([{ id: ParamRef.of(1), email: ParamRef.of('a@example.com') }])
-        .withReturning([ColumnRef.of('user', 'id')]);
+        .withReturning([ProjectionItem.of('id', ColumnRef.of('user', 'id'))]);
 
       const { sql } = adapter.lower(ast, { contract });
       expect(sql).toContain('RETURNING "user"."id"');
+    });
+
+    it('renders RETURNING with `AS <alias>` when the projection alias differs from the column name', () => {
+      const ast = InsertAst.into(TableSource.named('user'))
+        .withRows([{ id: ParamRef.of(1), email: ParamRef.of('a@example.com') }])
+        .withReturning([ProjectionItem.of('user_id', ColumnRef.of('user', 'id'))]);
+
+      const { sql } = adapter.lower(ast, { contract });
+      expect(sql).toContain('RETURNING "user"."id" AS "user_id"');
     });
 
     it('throws on DEFAULT value in VALUES (unsupported by SQLite)', () => {
@@ -295,7 +304,7 @@ describe('SQLite adapter', () => {
       const ast = UpdateAst.table(TableSource.named('user'))
         .withSet({ email: ParamRef.of('b@example.com') })
         .withWhere(BinaryExpr.eq(ColumnRef.of('user', 'id'), ParamRef.of(1)))
-        .withReturning([ColumnRef.of('user', 'email')]);
+        .withReturning([ProjectionItem.of('email', ColumnRef.of('user', 'email'))]);
 
       const { sql } = adapter.lower(ast, { contract });
       expect(sql).toBe(
@@ -318,7 +327,7 @@ describe('SQLite adapter', () => {
     it('renders delete with RETURNING', () => {
       const ast = DeleteAst.from(TableSource.named('user'))
         .withWhere(BinaryExpr.eq(ColumnRef.of('user', 'id'), ParamRef.of(1)))
-        .withReturning([ColumnRef.of('user', 'id')]);
+        .withReturning([ProjectionItem.of('id', ColumnRef.of('user', 'id'))]);
 
       const { sql } = adapter.lower(ast, { contract });
       expect(sql).toBe('DELETE FROM "user" WHERE "user"."id" = ? RETURNING "user"."id"');

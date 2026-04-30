@@ -211,10 +211,12 @@ class SqlRuntimeImpl<TContract extends Contract<SqlStorage> = Contract<SqlStorag
 
   /**
    * SQL pre-compile hook. Runs the registered middleware `beforeCompile`
-   * chain over the plan's draft (AST + meta) and returns a `SqlQueryPlan`
-   * with the rewritten AST and meta when the chain mutates them. The chain
-   * re-derives `meta.paramDescriptors` from the rewritten AST so descriptors
-   * stay in lockstep with the params the adapter will emit during lowering.
+   * chain over the plan's draft (AST + meta). Returns the original plan
+   * unchanged when no middleware rewrote the AST; otherwise returns a new
+   * plan carrying the rewritten AST and meta. The AST is the authoritative
+   * source of execution metadata, so a rewrite needs no sidecar
+   * reconciliation here — the lowering adapter and the encoder both walk
+   * the rewritten AST directly.
    */
   protected override async runBeforeCompile(plan: SqlQueryPlan): Promise<SqlQueryPlan> {
     const rewrittenDraft = await runBeforeCompileChain(

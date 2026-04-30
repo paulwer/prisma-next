@@ -6,6 +6,7 @@ import {
   type AnyQueryAst,
   type BinaryExpr,
   type ColumnRef,
+  collectOrderedParamRefs,
   type DeleteAst,
   type InsertAst,
   type InsertValue,
@@ -124,16 +125,12 @@ export function renderLoweredSql(
   contract: PostgresContract,
   codecLookup: CodecLookup,
 ): { readonly sql: string; readonly params: readonly unknown[] } {
-  const collectedParamRefs = ast.collectParamRefs();
+  const orderedRefs = collectOrderedParamRefs(ast);
   const indexMap = new Map<ParamRef, number>();
-  const params: unknown[] = [];
-  for (const ref of collectedParamRefs) {
-    if (indexMap.has(ref)) {
-      continue;
-    }
-    indexMap.set(ref, params.length + 1);
-    params.push(ref.value);
-  }
+  const params: unknown[] = orderedRefs.map((ref, i) => {
+    indexMap.set(ref, i + 1);
+    return ref.value;
+  });
   const pim: ParamIndexMap = { indexMap, codecLookup };
 
   const node = ast;
@@ -217,6 +214,27 @@ function renderProjection(
         return `${renderLiteral(item.expr)} AS ${alias}`;
       }
       return `${renderExpr(item.expr, contract, pim)} AS ${alias}`;
+    })
+    .join(', ');
+}
+
+function renderReturning(
+  items: ReadonlyArray<ProjectionItem>,
+  contract: PostgresContract,
+  pim: ParamIndexMap,
+): string {
+  return items
+    .map((item) => {
+      if (item.expr.kind === 'column-ref') {
+        const rendered = renderColumn(item.expr);
+        return item.expr.column === item.alias
+          ? rendered
+          : `${rendered} AS ${quoteIdentifier(item.alias)}`;
+      }
+      if (item.expr.kind === 'literal') {
+        return `${renderLiteral(item.expr)} AS ${quoteIdentifier(item.alias)}`;
+      }
+      return `${renderExpr(item.expr, contract, pim)} AS ${quoteIdentifier(item.alias)}`;
     })
     .join(', ');
 }
@@ -710,7 +728,7 @@ function renderInsert(ast: InsertAst, contract: PostgresContract, pim: ParamInde
       })()
     : '';
   const returningClause = ast.returning?.length
-    ? ` RETURNING ${ast.returning.map((col) => `${quoteIdentifier(col.table)}.${quoteIdentifier(col.column)}`).join(', ')}`
+    ? ` RETURNING ${renderReturning(ast.returning, contract, pim)}`
     : '';
 
   return `${insertClause}${onConflictClause}${returningClause}`;
@@ -743,7 +761,7 @@ function renderUpdate(ast: UpdateAst, contract: PostgresContract, pim: ParamInde
 
   const whereClause = ast.where ? ` WHERE ${renderWhere(ast.where, contract, pim)}` : '';
   const returningClause = ast.returning?.length
-    ? ` RETURNING ${ast.returning.map((col) => `${quoteIdentifier(col.table)}.${quoteIdentifier(col.column)}`).join(', ')}`
+    ? ` RETURNING ${renderReturning(ast.returning, contract, pim)}`
     : '';
 
   return `UPDATE ${table} SET ${setClauses.join(', ')}${whereClause}${returningClause}`;
@@ -753,7 +771,7 @@ function renderDelete(ast: DeleteAst, contract: PostgresContract, pim: ParamInde
   const table = quoteIdentifier(ast.table.name);
   const whereClause = ast.where ? ` WHERE ${renderWhere(ast.where, contract, pim)}` : '';
   const returningClause = ast.returning?.length
-    ? ` RETURNING ${ast.returning.map((col) => `${quoteIdentifier(col.table)}.${quoteIdentifier(col.column)}`).join(', ')}`
+    ? ` RETURNING ${renderReturning(ast.returning, contract, pim)}`
     : '';
 
   return `DELETE FROM ${table}${whereClause}${returningClause}`;
