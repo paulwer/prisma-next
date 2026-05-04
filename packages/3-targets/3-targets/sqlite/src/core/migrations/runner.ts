@@ -78,7 +78,9 @@ class SqliteMigrationRunner implements SqlMigrationRunner<SqlitePlanTargetDetail
         }
 
         const markerAtDestination = this.markerMatchesDestination(existingMarker, options.plan);
-        const skipOperations = markerAtDestination && options.plan.origin != null;
+        const isSelfEdge =
+          options.plan.origin?.storageHash === options.plan.destination.storageHash;
+        const skipOperations = markerAtDestination && options.plan.origin != null && !isSelfEdge;
 
         let operationsExecuted: number;
         let executedOperations: readonly SqlMigrationPlanOperation<SqlitePlanTargetDetails>[];
@@ -119,8 +121,23 @@ class SqliteMigrationRunner implements SqlMigrationRunner<SqlitePlanTargetDetail
           });
         }
 
-        await this.upsertMarker(driver, options, existingMarker);
-        await this.recordLedgerEntry(driver, options, existingMarker, executedOperations);
+        // Self-edge no-op detection: a self-edge migration whose ops had no
+        // ops to begin with and brings no new invariants produced no
+        // observable change. Skip the marker + ledger writes so an idempotent
+        // re-apply of a self-edge data transform doesn't churn updatedAt or
+        // pile up empty ledger entries. db update no-ops still write a
+        // ledger entry as audit trail.
+        const incomingInvariants = options.plan.providedInvariants;
+        const existingInvariants = new Set(existingMarker?.invariants ?? []);
+        const incomingIsSubsetOfExisting = incomingInvariants.every((id) =>
+          existingInvariants.has(id),
+        );
+        const isSelfEdgeNoOp = isSelfEdge && operationsExecuted === 0 && incomingIsSubsetOfExisting;
+
+        if (!isSelfEdgeNoOp) {
+          await this.upsertMarker(driver, options, existingMarker);
+          await this.recordLedgerEntry(driver, options, existingMarker, executedOperations);
+        }
 
         if (fkWasEnabled) {
           const fkIntegrityCheck = await this.verifyForeignKeyIntegrity(driver);
@@ -507,7 +524,7 @@ class SqliteMigrationRunner implements SqlMigrationRunner<SqlitePlanTargetDetail
     // the way Postgres does. Merge client-side under the runner's
     // BEGIN EXCLUSIVE — sort + dedupe so the JSON-encoded value is stable.
     const merged = new Set<string>(existingMarker?.invariants ?? []);
-    for (const inv of options.invariants ?? []) merged.add(inv);
+    for (const inv of options.plan.providedInvariants) merged.add(inv);
     const invariants = Array.from(merged).sort();
     const writeStatements = buildWriteMarkerStatements({
       storageHash: options.plan.destination.storageHash,

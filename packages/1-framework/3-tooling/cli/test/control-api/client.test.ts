@@ -869,6 +869,8 @@ describe('ControlClient progress emission', () => {
   describe('migrationApply()', () => {
     it('emits connect and migration spans when connection provided', async () => {
       const events: ControlProgressEvent[] = [];
+      let executedPlan: { readonly providedInvariants?: readonly string[] } | undefined;
+
       const { mockFamily, mockTarget, mockAdapter, mockDriverDescriptor, mockFamilyInstance } =
         createMockComponents();
 
@@ -882,10 +884,17 @@ describe('ControlClient progress emission', () => {
             }),
           }),
           createRunner: () => ({
-            execute: async () => ({
-              ok: true,
-              value: { operationsPlanned: 1, operationsExecuted: 1 },
-            }),
+            execute: async ({
+              plan,
+            }: {
+              readonly plan: { readonly providedInvariants?: readonly string[] };
+            }) => {
+              executedPlan = plan;
+              return {
+                ok: true,
+                value: { operationsPlanned: 1, operationsExecuted: 1 },
+              };
+            },
           }),
           contractToSchema: () => ({}),
         },
@@ -910,6 +919,7 @@ describe('ControlClient progress emission', () => {
             to: 'sha256:abc',
             toContract: createContract(),
             operations: [{ id: 'op1', label: 'CREATE TABLE', operationClass: 'additive' }],
+            providedInvariants: [],
           },
         ],
         connection: 'postgres://test',
@@ -919,6 +929,7 @@ describe('ControlClient progress emission', () => {
       await client.close();
 
       expect(result.ok).toBe(true);
+      expect(executedPlan?.providedInvariants).toEqual([]);
       if (result.ok) {
         expect(result.value.migrationsApplied).toBe(1);
         expect(result.value.markerHash).toBe('sha256:abc');
@@ -990,6 +1001,7 @@ describe('ControlClient progress emission', () => {
             to: 'sha256:abc',
             toContract: createContract(),
             operations: [{ id: 'op1', label: 'CREATE TABLE', operationClass: 'additive' }],
+            providedInvariants: [],
           },
         ],
         connection: 'postgres://test',
@@ -1049,6 +1061,7 @@ describe('ControlClient progress emission', () => {
             to: 'sha256:aaa',
             toContract: createContract(),
             operations: [{ id: 'op1', label: 'CREATE TABLE', operationClass: 'additive' }],
+            providedInvariants: [],
           },
           {
             dirName: '002_gap',
@@ -1056,6 +1069,7 @@ describe('ControlClient progress emission', () => {
             to: 'sha256:ccc',
             toContract: createContract(),
             operations: [{ id: 'op2', label: 'ALTER TABLE', operationClass: 'additive' }],
+            providedInvariants: [],
           },
         ],
         connection: 'postgres://test',

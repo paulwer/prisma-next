@@ -127,9 +127,14 @@ class PostgresMigrationRunner implements SqlMigrationRunner<PostgresPlanTargetDe
         return markerCheck;
       }
 
-      // db update (origin: null) always applies; migration-apply (origin set) skips if marker matches.
+      // db update (origin: null) always applies; migration-apply (origin set,
+      // origin !== destination) skips if marker already matches destination.
+      // Self-edges (origin === destination) intentionally bypass the skip:
+      // the migration is data-only, and the data transform's own check
+      // decides whether `run` fires.
       const markerAtDestination = this.markerMatchesDestination(existingMarker, options.plan);
-      const skipOperations = markerAtDestination && options.plan.origin != null;
+      const isSelfEdge = options.plan.origin?.storageHash === options.plan.destination.storageHash;
+      const skipOperations = markerAtDestination && options.plan.origin != null && !isSelfEdge;
       let applyValue: ApplyPlanSuccessValue;
 
       if (skipOperations) {
@@ -169,9 +174,39 @@ class PostgresMigrationRunner implements SqlMigrationRunner<PostgresPlanTargetDe
         });
       }
 
-      // Record marker and ledger entries
-      await this.upsertMarker(driver, options, existingMarker);
-      await this.recordLedgerEntry(driver, options, existingMarker, applyValue.executedOperations);
+      // Self-edge no-op detection: a self-edge migration with zero ops in
+      // the plan that brings no new invariants produced no observable
+      // change. Skip the marker + ledger writes so an idempotent re-apply
+      // of a self-edge data transform doesn't churn updatedAt or pile up
+      // empty ledger entries. db update no-ops still write a ledger entry
+      // as audit trail.
+      //
+      // TODO(invariant-routing follow-up): `executeDataTransform` always
+      // counts every op it visits (including self-skips via `check === true`
+      // or empty idempotency probe), so `operationsExecuted === 0` here
+      // means "the plan had zero ops" rather than "every op self-skipped".
+      // The CLI is unaffected today because `migration-apply.ts` marker-
+      // subtraction empties `effectiveRequired` first and short-circuits
+      // before we run; the non-CLI re-apply path needs a per-op `executed`
+      // flag threaded through `executeDataTransform` to recover the
+      // intended check. See review thread A13 / future M5 ADR draft.
+      const incomingInvariants = options.plan.providedInvariants;
+      const existingInvariants = new Set(existingMarker?.invariants ?? []);
+      const incomingIsSubsetOfExisting = incomingInvariants.every((id) =>
+        existingInvariants.has(id),
+      );
+      const isSelfEdgeNoOp =
+        isSelfEdge && applyValue.operationsExecuted === 0 && incomingIsSubsetOfExisting;
+
+      if (!isSelfEdgeNoOp) {
+        await this.upsertMarker(driver, options, existingMarker);
+        await this.recordLedgerEntry(
+          driver,
+          options,
+          existingMarker,
+          applyValue.executedOperations,
+        );
+      }
 
       await this.commitTransaction(driver);
       committed = true;
@@ -616,9 +651,7 @@ class PostgresMigrationRunner implements SqlMigrationRunner<PostgresPlanTargetDe
     options: SqlMigrationRunnerExecuteOptions<PostgresPlanTargetDetails>,
     existingMarker: ContractMarkerRecord | null,
   ): Promise<void> {
-    // Sort + dedupe so the INSERT path writes a stable initial value.
-    // UPDATE merges server-side, so no client-side union is needed.
-    const incomingInvariants = Array.from(new Set(options.invariants ?? [])).sort();
+    const incomingInvariants = options.plan.providedInvariants;
     const writeStatements = buildMergeMarkerStatements({
       storageHash: options.plan.destination.storageHash,
       profileHash:

@@ -51,7 +51,10 @@ export function reconstructGraph(packages: readonly MigrationPackage[]): Migrati
     const { to } = pkg.metadata;
 
     if (from === to) {
-      throw errorSameSourceAndTarget(pkg.dirPath, from);
+      const hasDataOp = pkg.ops.some((op) => op.operationClass === 'data');
+      if (!hasDataOp) {
+        throw errorSameSourceAndTarget(pkg.dirPath, from);
+      }
     }
 
     nodes.add(from);
@@ -175,15 +178,16 @@ export function findPathWithInvariants(
   if (required.size === 0) {
     return findPath(graph, fromHash, toHash);
   }
-  if (fromHash === toHash) {
-    // Empty path covers no invariants; required is non-empty ⇒ unsatisfiable.
-    return null;
-  }
 
   interface InvState {
     readonly node: string;
     readonly covered: ReadonlySet<string>;
   }
+  // `\0` is a safe segment separator: `validateInvariantId` rejects any id
+  // containing whitespace or control characters (NUL is U+0000), and node
+  // hashes are hex strings. Distinct `(node, covered)` tuples therefore
+  // map to distinct strings. If `validateInvariantId` is ever relaxed,
+  // re-confirm dedup correctness here.
   const stateKey = (s: InvState): string => {
     if (s.covered.size === 0) return `${s.node}\0`;
     return `${s.node}\0${[...s.covered].sort().join('\0')}`;
@@ -263,66 +267,210 @@ export interface PathDecision {
   readonly alternativeCount: number;
   readonly tieBreakReasons: readonly string[];
   readonly refName?: string;
+  /** The caller-supplied required invariant set, sorted ascending. */
+  readonly requiredInvariants: readonly string[];
+  /**
+   * The subset of `requiredInvariants` actually covered by edges on
+   * `selectedPath`. Always a subset of `requiredInvariants` (when the path
+   * is satisfying, equal to it); always derived from `selectedPath`.
+   */
+  readonly satisfiedInvariants: readonly string[];
+}
+
+/**
+ * Outcome of {@link findPathWithDecision}. The pathfinder distinguishes
+ * three cases up front so callers don't re-derive structural reachability:
+ *
+ * - `ok` — a path covering `required` exists; `decision` carries the
+ *   selection metadata and per-edge invariants.
+ * - `unreachable` — `from`→`to` has no structural path. Mapped by callers
+ *   to the existing no-path / `NO_TARGET` diagnostic.
+ * - `unsatisfiable` — `from`→`to` is structurally reachable but no path
+ *   covers every required invariant. `structuralPath` is the
+ *   `findPath(graph, from, to)` result, included so callers don't have to
+ *   recompute it when raising `MIGRATION.NO_INVARIANT_PATH`. `missing` is
+ *   the subset of `required` that the structural path does *not* cover —
+ *   correctly accounts for partial coverage when some required invariants
+ *   are met by the fallback path. Only emitted when `required` is
+ *   non-empty.
+ */
+export type FindPathOutcome =
+  | { readonly kind: 'ok'; readonly decision: PathDecision }
+  | { readonly kind: 'unreachable' }
+  | {
+      readonly kind: 'unsatisfiable';
+      readonly structuralPath: readonly MigrationEdge[];
+      readonly missing: readonly string[];
+    };
+
+/**
+ * Routing context for {@link findPathWithDecision}. Both fields are optional;
+ * `refName` is only used to decorate the resulting `PathDecision` for the
+ * JSON envelope, and `required` defaults to an empty set (purely structural
+ * routing). They are passed via a single options object so the call sites
+ * cannot silently swap two adjacent string parameters.
+ */
+export interface FindPathWithDecisionOptions {
+  readonly refName?: string;
+  readonly required?: ReadonlySet<string>;
 }
 
 /**
  * Find the shortest path from `fromHash` to `toHash` and return structured
- * path-decision metadata for machine-readable output.
+ * path-decision metadata for machine-readable output. When `required` is
+ * non-empty, the returned path is the shortest one whose edges collectively
+ * cover every required invariant.
+ *
+ * The discriminated return type tells the caller *why* a path could not be
+ * found, so the CLI can pick the right structured error without re-running
+ * a structural BFS.
  */
 export function findPathWithDecision(
   graph: MigrationGraph,
   fromHash: string,
   toHash: string,
-  refName?: string,
-): PathDecision | null {
-  if (fromHash === toHash) {
+  options: FindPathWithDecisionOptions = {},
+): FindPathOutcome {
+  const { refName, required = new Set<string>() } = options;
+  const requiredInvariants = [...required].sort();
+
+  if (fromHash === toHash && required.size === 0) {
     return {
-      selectedPath: [],
-      fromHash,
-      toHash,
-      alternativeCount: 0,
-      tieBreakReasons: [],
-      ...ifDefined('refName', refName),
+      kind: 'ok',
+      decision: {
+        selectedPath: [],
+        fromHash,
+        toHash,
+        alternativeCount: 0,
+        tieBreakReasons: [],
+        requiredInvariants,
+        satisfiedInvariants: [],
+        ...ifDefined('refName', refName),
+      },
     };
   }
 
-  const path = findPath(graph, fromHash, toHash);
-  if (!path) return null;
+  const path = findPathWithInvariants(graph, fromHash, toHash, required);
+  if (!path) {
+    if (required.size === 0) {
+      return { kind: 'unreachable' };
+    }
+    const structural = findPath(graph, fromHash, toHash);
+    if (structural === null) {
+      return { kind: 'unreachable' };
+    }
+    const coveredByStructural = new Set<string>();
+    for (const edge of structural) {
+      for (const inv of edge.invariants) {
+        if (required.has(inv)) coveredByStructural.add(inv);
+      }
+    }
+    const missing = requiredInvariants.filter((id) => !coveredByStructural.has(id));
+    return { kind: 'unsatisfiable', structuralPath: structural, missing };
+  }
+
+  const satisfiedInvariants = computeSatisfiedInvariants(required, path);
 
   // Single reverse BFS marks every node from which `toHash` is reachable.
   // Replaces a per-edge `findPath(e.to, toHash)` call inside the loop below,
   // which made the whole function O(|path| · (V + E)) instead of O(V + E).
   const reachesTarget = collectNodesReachingTarget(graph, toHash);
+  const coveragePrefixes = requiredCoveragePrefixes(required, path);
 
   const tieBreakReasons: string[] = [];
   let alternativeCount = 0;
 
-  for (const edge of path) {
+  for (const [i, edge] of path.entries()) {
     const outgoing = graph.forwardChain.get(edge.from);
-    if (outgoing && outgoing.length > 1) {
-      const reachable = outgoing.filter((e) => reachesTarget.has(e.to));
-      if (reachable.length > 1) {
-        alternativeCount += reachable.length - 1;
-        const sorted = sortedNeighbors(reachable);
-        if (sorted[0] && sorted[0].migrationHash === edge.migrationHash) {
-          if (reachable.some((e) => e.migrationHash !== edge.migrationHash)) {
-            tieBreakReasons.push(
-              `at ${edge.from}: ${reachable.length} candidates, selected by tie-break`,
-            );
-          }
-        }
-      }
+    if (!outgoing || outgoing.length <= 1) continue;
+    const reachable = outgoing.filter((e) => reachesTarget.has(e.to));
+    if (reachable.length <= 1) continue;
+
+    let comparisonPool: readonly MigrationEdge[] = reachable;
+    if (required.size > 0) {
+      // coveragePrefixes is built one-per-edge from path, so the index is
+      // always in range here; the explicit guard keeps the type narrowed
+      // without a non-null assertion.
+      const prefixSet = coveragePrefixes[i];
+      if (prefixSet === undefined) continue;
+      comparisonPool = invariantViableAlternativesAtStep(required, prefixSet, reachable);
+    }
+
+    alternativeCount += reachable.length - 1;
+    const sorted = sortedNeighbors(reachable);
+    if (sorted[0]?.migrationHash !== edge.migrationHash) continue;
+    if (!reachable.some((e) => e.migrationHash !== edge.migrationHash)) continue;
+
+    const sortedViable = sortedNeighbors(comparisonPool);
+    if (
+      sortedViable.length > 1 &&
+      sortedViable[0]?.migrationHash === edge.migrationHash &&
+      sortedViable.some((e) => e.migrationHash !== edge.migrationHash)
+    ) {
+      tieBreakReasons.push(
+        `at ${edge.from}: ${comparisonPool.length} candidates, selected by tie-break`,
+      );
     }
   }
 
   return {
-    selectedPath: path,
-    fromHash,
-    toHash,
-    alternativeCount,
-    tieBreakReasons,
-    ...ifDefined('refName', refName),
+    kind: 'ok',
+    decision: {
+      selectedPath: path,
+      fromHash,
+      toHash,
+      alternativeCount,
+      tieBreakReasons,
+      requiredInvariants,
+      satisfiedInvariants,
+      ...ifDefined('refName', refName),
+    },
   };
+}
+
+function computeSatisfiedInvariants(
+  required: ReadonlySet<string>,
+  path: readonly MigrationEdge[],
+): readonly string[] {
+  if (required.size === 0) return [];
+  const covered = new Set<string>();
+  for (const edge of path) {
+    for (const inv of edge.invariants) {
+      if (required.has(inv)) covered.add(inv);
+    }
+  }
+  return [...covered].sort();
+}
+
+/**
+ * For each edge on path, invariant coverage accumulated from earlier edges only —
+ * `(required ∩ ∪_{j<i} path[j].invariants)` represented as cumulative set along `required`,
+ * keyed as "full set of required ids satisfied before taking path[i]".
+ */
+function requiredCoveragePrefixes(
+  required: ReadonlySet<string>,
+  path: readonly MigrationEdge[],
+): readonly ReadonlySet<string>[] {
+  const prefixes: ReadonlySet<string>[] = [];
+  const acc = new Set<string>();
+  for (const edge of path) {
+    prefixes.push(new Set(acc));
+    for (const inv of edge.invariants) {
+      if (required.has(inv)) acc.add(inv);
+    }
+  }
+  return prefixes;
+}
+
+function invariantViableAlternativesAtStep(
+  required: ReadonlySet<string>,
+  coverageBeforeTakingEdge: ReadonlySet<string>,
+  outgoing: readonly MigrationEdge[],
+): readonly MigrationEdge[] {
+  if (required.size === 0) return [...outgoing];
+  return outgoing.filter((e) =>
+    [...required].every((id) => coverageBeforeTakingEdge.has(id) || e.invariants.includes(id)),
+  );
 }
 
 /**

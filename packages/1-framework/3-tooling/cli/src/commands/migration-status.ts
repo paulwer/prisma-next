@@ -1,6 +1,10 @@
 import type { MigrationPlanOperation } from '@prisma-next/framework-components/control';
 import { EMPTY_CONTRACT_HASH } from '@prisma-next/migration-tools/constants';
-import { MigrationToolsError } from '@prisma-next/migration-tools/errors';
+import {
+  errorNoInvariantPath,
+  errorUnknownInvariant,
+  MigrationToolsError,
+} from '@prisma-next/migration-tools/errors';
 import type { MigrationEdge, MigrationGraph } from '@prisma-next/migration-tools/graph';
 import {
   findPath,
@@ -8,7 +12,7 @@ import {
   findReachableLeaves,
 } from '@prisma-next/migration-tools/migration-graph';
 import type { MigrationPackage } from '@prisma-next/migration-tools/package';
-import type { Refs } from '@prisma-next/migration-tools/refs';
+import type { RefEntry, Refs } from '@prisma-next/migration-tools/refs';
 import { readRefs, resolveRef } from '@prisma-next/migration-tools/refs';
 import { ifDefined } from '@prisma-next/utils/defined';
 import { notOk, ok, type Result } from '@prisma-next/utils/result';
@@ -25,6 +29,7 @@ import {
 } from '../utils/cli-errors';
 import {
   addGlobalOptions,
+  collectDeclaredInvariants,
   loadMigrationPackages,
   maskConnectionUrl,
   readContractEnvelope,
@@ -32,6 +37,7 @@ import {
   setCommandDescriptions,
   setCommandExamples,
   toPathDecisionResult,
+  toStructuralEdge,
 } from '../utils/command-helpers';
 import {
   type EdgeStatus,
@@ -80,17 +86,33 @@ export interface MigrationStatusResult {
   readonly targetHash: string;
   readonly contractHash: string;
   readonly refs?: readonly StatusRef[];
+  /** Required invariants from the active ref, sorted ascending. Always present (`[]` when no `--ref` or the ref declares none) — knowable offline. */
+  readonly requiredInvariants: readonly string[];
+  /**
+   * Invariants the marker has applied at least once, intersected with
+   * `requiredInvariants` for display relevance. JSON consumers see only the
+   * subset overlapping the active ref's required set — the full unfiltered
+   * marker invariant list lives on `marker.invariants` (control plane) and
+   * is not surfaced here. Present only in `mode === 'online'`; absent when
+   * offline (the marker is unknown, not empty).
+   */
+  readonly appliedInvariants?: readonly string[];
+  /** required − applied. Present only in `mode === 'online'`; absent when offline. */
+  readonly missingInvariants?: readonly string[];
   readonly pathDecision?: {
     readonly fromHash: string;
     readonly toHash: string;
     readonly alternativeCount: number;
     readonly tieBreakReasons: readonly string[];
     readonly refName?: string;
+    readonly requiredInvariants: readonly string[];
+    readonly satisfiedInvariants: readonly string[];
     readonly selectedPath: readonly {
       readonly dirName: string;
       readonly migrationHash: string;
       readonly from: string;
       readonly to: string;
+      readonly invariants: readonly string[];
     }[];
   };
   readonly summary: string;
@@ -357,6 +379,7 @@ async function executeMigrationStatusCommand(
 
   let activeRefName: string | undefined;
   let activeRefHash: string | undefined;
+  let activeRefEntry: RefEntry | undefined;
   let allRefs: Refs = {};
   try {
     allRefs = await readRefs(refsDir);
@@ -370,7 +393,8 @@ async function executeMigrationStatusCommand(
   if (options.ref) {
     activeRefName = options.ref;
     try {
-      activeRefHash = resolveRef(allRefs, activeRefName).hash;
+      activeRefEntry = resolveRef(allRefs, activeRefName);
+      activeRefHash = activeRefEntry.hash;
     } catch (error) {
       if (MigrationToolsError.is(error)) {
         return notOk(mapMigrationToolsError(error));
@@ -378,6 +402,8 @@ async function executeMigrationStatusCommand(
       throw error;
     }
   }
+
+  const requiredInvariants: readonly string[] = [...(activeRefEntry?.invariants ?? [])].sort();
 
   const statusRefs: StatusRef[] = Object.entries(allRefs).map(([name, entry]) => ({
     name,
@@ -395,6 +421,12 @@ async function executeMigrationStatusCommand(
     }
     if (activeRefName) {
       details.push({ label: 'ref', value: activeRefName });
+    }
+    if (activeRefEntry && activeRefEntry.invariants.length > 0) {
+      details.push({
+        label: 'required',
+        value: formatInvariantList(activeRefEntry.invariants),
+      });
     }
     const header = formatStyledHeader({
       command: 'migration status',
@@ -453,6 +485,7 @@ async function executeMigrationStatusCommand(
       contractHash,
       summary: 'No migrations found',
       diagnostics,
+      requiredInvariants,
     });
   }
 
@@ -480,6 +513,7 @@ async function executeMigrationStatusCommand(
   }
 
   let markerHash: string | undefined;
+  let markerInvariants: readonly string[] = [];
   let mode: 'online' | 'offline' = 'offline';
 
   if (dbConnection && hasDriver) {
@@ -492,7 +526,9 @@ async function executeMigrationStatusCommand(
     });
     try {
       await client.connect(dbConnection);
-      markerHash = (await client.readMarker())?.storageHash;
+      const marker = await client.readMarker();
+      markerHash = marker?.storageHash;
+      markerInvariants = marker?.invariants ?? [];
       mode = 'online';
     } catch {
       if (!flags.json && !flags.quiet) {
@@ -500,6 +536,32 @@ async function executeMigrationStatusCommand(
       }
     } finally {
       await client.close();
+    }
+  }
+
+  // Pre-check unknown invariants. Online: union the graph's declared
+  // invariants with the marker's recorded set so a retired-but-applied
+  // invariant doesn't surface as MIGRATION.UNKNOWN_INVARIANT — apply would
+  // route fine because marker subtraction empties `effectiveRequired`.
+  // Offline: keep the check graph-strict (the marker is unknown, and a
+  // missing declarer is the dominant signal we can offer).
+  if (activeRefEntry && activeRefEntry.invariants.length > 0) {
+    const declared = collectDeclaredInvariants(graph);
+    const known = new Set<string>(declared);
+    if (mode === 'online') {
+      for (const id of markerInvariants) known.add(id);
+    }
+    const unknown = activeRefEntry.invariants.filter((id) => !known.has(id));
+    if (unknown.length > 0) {
+      return notOk(
+        mapMigrationToolsError(
+          errorUnknownInvariant({
+            ...ifDefined('refName', activeRefName),
+            unknown,
+            declared: [...declared].sort(),
+          }),
+        ),
+      );
     }
   }
 
@@ -548,6 +610,7 @@ async function executeMigrationStatusCommand(
       summary: `${bundles.length} migration(s) on disk`,
       diagnostics,
       markerHash,
+      requiredInvariants,
       ...(statusRefs.length > 0 ? { refs: statusRefs } : {}),
     });
   }
@@ -588,6 +651,7 @@ async function executeMigrationStatusCommand(
       summary: `${bundles.length} migration(s) on disk`,
       diagnostics,
       ...ifDefined('markerHash', markerHash),
+      requiredInvariants,
       ...(statusRefs.length > 0 ? { refs: statusRefs } : {}),
       graph,
       bundles,
@@ -612,14 +676,39 @@ async function executeMigrationStatusCommand(
   const pendingCount = edgeStatuses.filter((e) => e.status === 'pending').length;
   const appliedCount = edgeStatuses.filter((e) => e.status === 'applied').length;
 
+  let appliedInvariants: readonly string[] | undefined;
+  let missingInvariants: readonly string[] | undefined;
+  let effectiveRequired = new Set<string>();
+  if (mode === 'online') {
+    // Mirrors `migration-apply.ts`: compute `effectiveRequired = required −
+    // marker.invariants` directly, then derive the display fields from it.
+    // `appliedInvariants` is the intersection (`required ∩ marker`), which
+    // is what JSON consumers see for the active ref; the unfiltered set
+    // lives on `marker.invariants`.
+    const markerSet = new Set(markerInvariants);
+    effectiveRequired = new Set(requiredInvariants.filter((id) => !markerSet.has(id)));
+    appliedInvariants = requiredInvariants.filter((id) => markerSet.has(id));
+    missingInvariants = [...effectiveRequired].sort();
+  }
+
+  // The marker can match the structural target while still missing required
+  // invariants — for example, a self-edge that provides X, applied via a ref
+  // declaring X. `pendingCount` (structural) says zero in that case but
+  // `effectiveRequired` is non-empty, so up-to-date messaging would mislead.
+  const hasInvariantWork = effectiveRequired.size > 0;
+  const missingList = [...effectiveRequired].sort().join(', ');
+
   let summary: string;
   if (mode === 'online') {
     if (markerHash !== undefined && !graph.nodes.has(markerHash) && markerHash === contractHash) {
       summary = `${bundles.length} migration(s) on disk`;
     } else if (activeRefHash && markerHash !== undefined) {
-      summary = summarizeRefDistance(graph, markerHash, activeRefHash, activeRefName!);
-    } else if (pendingCount === 0) {
+      const distance = summarizeRefDistance(graph, markerHash, activeRefHash, activeRefName!);
+      summary = hasInvariantWork ? `${distance} — missing invariant(s): ${missingList}` : distance;
+    } else if (pendingCount === 0 && !hasInvariantWork) {
       summary = `Database is up to date (${appliedCount} migration${appliedCount !== 1 ? 's' : ''} applied)`;
+    } else if (pendingCount === 0 && hasInvariantWork) {
+      summary = `Missing invariant(s): ${missingList} — run 'prisma-next migration apply --ref ${activeRefName ?? '<ref>'}' to apply`;
     } else if (markerHash === undefined) {
       summary = `${pendingCount} pending migration(s) — database has no marker`;
     } else {
@@ -627,6 +716,37 @@ async function executeMigrationStatusCommand(
     }
   } else {
     summary = `${entries.length} migration(s) on disk`;
+  }
+
+  let pathDecision: MigrationStatusResult['pathDecision'];
+  let routingUnreachable = false;
+  if (mode === 'online') {
+    const originHash = markerHash ?? EMPTY_CONTRACT_HASH;
+    const outcome = findPathWithDecision(graph, originHash, targetHash, {
+      ...ifDefined('refName', activeRefName),
+      required: effectiveRequired,
+    });
+    if (outcome.kind === 'ok') {
+      pathDecision = toPathDecisionResult(outcome.decision);
+    } else if (outcome.kind === 'unsatisfiable') {
+      return notOk(
+        mapMigrationToolsError(
+          errorNoInvariantPath({
+            ...ifDefined('refName', activeRefName),
+            required: [...effectiveRequired].sort(),
+            missing: outcome.missing,
+            structuralPath: outcome.structuralPath.map(toStructuralEdge),
+          }),
+        ),
+      );
+    } else {
+      // outcome.kind === 'unreachable' — origin (marker) has no structural
+      // path to the active target. `pendingCount` and `hasInvariantWork`
+      // both report zero in this case, but emitting MIGRATION.UP_TO_DATE
+      // would be wrong: the database simply cannot reach the requested
+      // ref/contract from its current state. Suppress UP_TO_DATE below.
+      routingUnreachable = true;
+    }
   }
 
   if (mode === 'online') {
@@ -645,21 +765,22 @@ async function executeMigrationStatusCommand(
         message: `${pendingCount} migration(s) pending`,
         hints: ["Run 'prisma-next migration apply' to apply pending migrations"],
       });
-    } else {
+    } else if (hasInvariantWork) {
+      diagnostics.push({
+        code: 'MIGRATION.INVARIANTS_PENDING',
+        severity: 'info',
+        message: `Missing required invariant(s): ${missingList}`,
+        hints: [
+          `Run 'prisma-next migration apply --ref ${activeRefName ?? '<ref>'}' to apply a path that covers the required invariants`,
+        ],
+      });
+    } else if (!routingUnreachable) {
       diagnostics.push({
         code: 'MIGRATION.UP_TO_DATE',
         severity: 'info',
         message: 'Database is up to date',
         hints: [],
       });
-    }
-  }
-
-  let pathDecision: MigrationStatusResult['pathDecision'];
-  if (mode === 'online' && markerHash !== undefined) {
-    const decision = findPathWithDecision(graph, markerHash, targetHash, activeRefName);
-    if (decision) {
-      pathDecision = toPathDecisionResult(decision);
     }
   }
 
@@ -672,6 +793,9 @@ async function executeMigrationStatusCommand(
     summary,
     diagnostics,
     ...ifDefined('markerHash', markerHash),
+    requiredInvariants,
+    ...ifDefined('appliedInvariants', appliedInvariants),
+    ...ifDefined('missingInvariants', missingInvariants),
     ...(statusRefs.length > 0 ? { refs: statusRefs } : {}),
     ...ifDefined('pathDecision', pathDecision),
     graph,
@@ -712,13 +836,19 @@ export function createMigrationStatusCommand(): Command {
 
       const exitCode = handleResult(result, flags, ui, (statusResult) => {
         if (flags.json) {
+          // Strip non-JSON-shape fields before emitting. These belong to
+          // the in-memory result so the human renderer can avoid
+          // recomputing them, but they would either bloat the wire format
+          // (graph, bundles, edgeStatuses) or expose internals
+          // (activeRefHash, activeRefName, diverged) that consumers should
+          // read off `pathDecision` / `refs` instead.
           const {
-            graph: _g,
-            bundles: _b,
-            edgeStatuses: _es,
-            activeRefHash: _arh,
-            activeRefName: _arn,
-            diverged: _d,
+            graph: _graph,
+            bundles: _bundles,
+            edgeStatuses: _edgeStatuses,
+            activeRefHash: _activeRefHash,
+            activeRefName: _activeRefName,
+            diverged: _diverged,
             ...jsonResult
           } = statusResult;
           ui.output(JSON.stringify(jsonResult, null, 2));
@@ -777,7 +907,7 @@ function formatLegend(colorize: boolean): string {
   return c(dim, parts.join('  '));
 }
 
-function formatStatusSummary(result: MigrationStatusResult, colorize: boolean): string {
+export function formatStatusSummary(result: MigrationStatusResult, colorize: boolean): string {
   const c = (fn: (s: string) => string, s: string) => (colorize ? fn(s) : s);
   const lines: string[] = [];
 
@@ -785,17 +915,31 @@ function formatStatusSummary(result: MigrationStatusResult, colorize: boolean): 
   const pendingCount = result.migrations.filter((e) => e.status === 'pending').length;
 
   const hasWarnings = result.diagnostics?.some((d) => d.severity === 'warn') ?? false;
+  // INVARIANTS_PENDING is filed at severity 'info' (per ADR 208) so the
+  // warn-severity check above doesn't see it. It still represents pending
+  // work, so it must promote the summary off the success icon.
+  const hasInvariantPending =
+    result.diagnostics?.some((d) => d.code === 'MIGRATION.INVARIANTS_PENDING') ?? false;
 
   if (result.mode === 'online') {
     if (hasUnknown || hasWarnings) {
       lines.push(`${c(yellow, '⚠')} ${result.summary}`);
-    } else if (pendingCount === 0) {
+    } else if (pendingCount === 0 && !hasInvariantPending) {
       lines.push(`${c(cyan, '✔')} ${result.summary}`);
     } else {
       lines.push(`${c(yellow, '⧗')} ${result.summary}`);
     }
   } else {
     lines.push(result.summary);
+  }
+
+  if (result.requiredInvariants.length > 0) {
+    if (result.appliedInvariants !== undefined && result.missingInvariants !== undefined) {
+      lines.push(`${c(dim, 'applied  ')}${formatInvariantList(result.appliedInvariants)}`);
+      lines.push(`${c(dim, 'missing  ')}${formatInvariantList(result.missingInvariants)}`);
+    } else {
+      lines.push(`${c(dim, 'applied  ')}(unknown — connect a database to evaluate)`);
+    }
   }
 
   const warnings = result.diagnostics?.filter((d) => d.severity === 'warn') ?? [];
@@ -807,6 +951,10 @@ function formatStatusSummary(result: MigrationStatusResult, colorize: boolean): 
   }
 
   return lines.join('\n');
+}
+
+function formatInvariantList(ids: readonly string[]): string {
+  return ids.length === 0 ? '(none)' : ids.join(', ');
 }
 
 function summarizeRefDistance(

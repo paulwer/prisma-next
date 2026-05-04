@@ -72,12 +72,6 @@ export interface MongoMigrationRunnerExecuteOptions {
   readonly frameworkComponents: ReadonlyArray<TargetBoundComponentDescriptor<'mongo', 'mongo'>>;
   readonly strictVerification?: boolean;
   readonly context?: OperationContext;
-  /**
-   * Invariant ids contributed by this apply (the migration's `providedInvariants`).
-   * The runner unions these into `marker.invariants` atomically with the marker write.
-   * Defaults to `[]` for marker-only flows.
-   */
-  readonly invariants?: readonly string[];
 }
 
 function runnerFailure(
@@ -188,9 +182,7 @@ export class MongoMigrationRunner {
     const destination = options.plan.destination;
     const profileHash = options.destinationContract.profileHash ?? destination.storageHash;
 
-    // Sort + dedupe so the initMarker path writes a stable initial value.
-    // updateMarker merges server-side, so no client-side union is needed.
-    const incomingInvariants = Array.from(new Set(options.invariants ?? [])).sort();
+    const incomingInvariants = options.plan.providedInvariants ?? [];
     const existingInvariantSet = new Set(existingMarker?.invariants ?? []);
     const incomingIsSubsetOfExisting = incomingInvariants.every((id) =>
       existingInvariantSet.has(id),
@@ -203,57 +195,68 @@ export class MongoMigrationRunner {
     // Skip marker/ledger writes (and schema verification) only when the apply
     // is a true no-op: no operations executed, marker already at destination,
     // and every incoming invariant is already in the stored set.
-    if (operationsExecuted === 0 && markerAlreadyAtDestination && incomingIsSubsetOfExisting) {
-      return ok({ operationsPlanned: operations.length, operationsExecuted });
-    }
+    //
+    // Divergence from the SQL runners (postgres/sqlite): those runners gate
+    // the no-op skip on `isSelfEdge` (origin === destination) only, so a
+    // non-self-edge `db update` that introspects-as-no-op still writes a
+    // ledger entry. Mongo skips even those because the runner has no
+    // structural distinction between self-edge and re-apply — invariant-
+    // aware routing here does not yet differentiate between the two
+    // ledger semantics. If the SQL audit-trail behavior should hold for
+    // Mongo too, gate this `isNoOp` on a self-edge check (or, conversely,
+    // align the SQL runners to skip non-self-edge no-ops uniformly).
+    const isNoOp =
+      operationsExecuted === 0 && markerAlreadyAtDestination && incomingIsSubsetOfExisting;
 
-    const liveSchema = await this.deps.introspectSchema();
-    const verifyResult = verifyMongoSchema({
-      contract: options.destinationContract,
-      schema: liveSchema,
-      strict: options.strictVerification ?? true,
-      frameworkComponents: options.frameworkComponents,
-      ...(options.context ? { context: options.context } : {}),
-    });
-    if (!verifyResult.ok) {
-      return runnerFailure('SCHEMA_VERIFY_FAILED', verifyResult.summary, {
-        why: 'The resulting database schema does not satisfy the destination contract.',
-        meta: { issues: verifyResult.schema.issues },
+    if (!isNoOp) {
+      const liveSchema = await this.deps.introspectSchema();
+      const verifyResult = verifyMongoSchema({
+        contract: options.destinationContract,
+        schema: liveSchema,
+        strict: options.strictVerification ?? true,
+        frameworkComponents: options.frameworkComponents,
+        ...(options.context ? { context: options.context } : {}),
       });
-    }
-
-    if (existingMarker) {
-      const updated = await markerOps.updateMarker(existingMarker.storageHash, {
-        storageHash: destination.storageHash,
-        profileHash,
-        invariants: incomingInvariants,
-      });
-      if (!updated) {
-        return runnerFailure(
-          'MARKER_CAS_FAILURE',
-          'Marker was modified by another process during migration execution.',
-          {
-            meta: {
-              expectedStorageHash: existingMarker.storageHash,
-              destinationStorageHash: destination.storageHash,
-            },
-          },
-        );
+      if (!verifyResult.ok) {
+        return runnerFailure('SCHEMA_VERIFY_FAILED', verifyResult.summary, {
+          why: 'The resulting database schema does not satisfy the destination contract.',
+          meta: { issues: verifyResult.schema.issues },
+        });
       }
-    } else {
-      await markerOps.initMarker({
-        storageHash: destination.storageHash,
-        profileHash,
-        invariants: incomingInvariants,
+
+      if (existingMarker) {
+        const updated = await markerOps.updateMarker(existingMarker.storageHash, {
+          storageHash: destination.storageHash,
+          profileHash,
+          invariants: incomingInvariants,
+        });
+        if (!updated) {
+          return runnerFailure(
+            'MARKER_CAS_FAILURE',
+            'Marker was modified by another process during migration execution.',
+            {
+              meta: {
+                expectedStorageHash: existingMarker.storageHash,
+                destinationStorageHash: destination.storageHash,
+              },
+            },
+          );
+        }
+      } else {
+        await markerOps.initMarker({
+          storageHash: destination.storageHash,
+          profileHash,
+          invariants: incomingInvariants,
+        });
+      }
+
+      const originHash = existingMarker?.storageHash ?? '';
+      await markerOps.writeLedgerEntry({
+        edgeId: `${originHash}->${destination.storageHash}`,
+        from: originHash,
+        to: destination.storageHash,
       });
     }
-
-    const originHash = existingMarker?.storageHash ?? '';
-    await markerOps.writeLedgerEntry({
-      edgeId: `${originHash}->${destination.storageHash}`,
-      from: originHash,
-      to: destination.storageHash,
-    });
 
     return ok({ operationsPlanned: operations.length, operationsExecuted });
   }

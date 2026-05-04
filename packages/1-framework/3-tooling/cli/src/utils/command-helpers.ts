@@ -1,7 +1,8 @@
 import { readFile } from 'node:fs/promises';
 import type { ControlTargetDescriptor } from '@prisma-next/framework-components/control';
 import { hasMigrations } from '@prisma-next/framework-components/control';
-import type { MigrationGraph } from '@prisma-next/migration-tools/graph';
+import type { NoInvariantPathStructuralEdge } from '@prisma-next/migration-tools/errors';
+import type { MigrationEdge, MigrationGraph } from '@prisma-next/migration-tools/graph';
 import { readMigrationsDir } from '@prisma-next/migration-tools/io';
 import type { PathDecision } from '@prisma-next/migration-tools/migration-graph';
 import { reconstructGraph } from '@prisma-next/migration-tools/migration-graph';
@@ -110,12 +111,43 @@ export interface PathDecisionResult {
   readonly alternativeCount: number;
   readonly tieBreakReasons: readonly string[];
   readonly refName?: string;
+  readonly requiredInvariants: readonly string[];
+  readonly satisfiedInvariants: readonly string[];
   readonly selectedPath: readonly {
     readonly dirName: string;
     readonly migrationHash: string;
     readonly from: string;
     readonly to: string;
+    readonly invariants: readonly string[];
   }[];
+}
+
+export function collectDeclaredInvariants(graph: MigrationGraph): ReadonlySet<string> {
+  const declared = new Set<string>();
+  for (const edges of graph.forwardChain.values()) {
+    for (const edge of edges) {
+      for (const inv of edge.invariants) {
+        declared.add(inv);
+      }
+    }
+  }
+  return declared;
+}
+
+/**
+ * Maps a `MigrationEdge` to the structural-edge shape used in the
+ * `MIGRATION.NO_INVARIANT_PATH` error envelope. Shared between
+ * `migration apply` and `migration status` so both commands surface
+ * the same JSON wire shape when an invariant-aware route is unsatisfiable.
+ */
+export function toStructuralEdge(edge: MigrationEdge): NoInvariantPathStructuralEdge {
+  return {
+    dirName: edge.dirName,
+    migrationHash: edge.migrationHash,
+    from: edge.from,
+    to: edge.to,
+    invariants: edge.invariants,
+  };
 }
 
 /**
@@ -127,12 +159,15 @@ export function toPathDecisionResult(decision: PathDecision): PathDecisionResult
     toHash: decision.toHash,
     alternativeCount: decision.alternativeCount,
     tieBreakReasons: decision.tieBreakReasons,
+    requiredInvariants: decision.requiredInvariants ?? [],
+    satisfiedInvariants: decision.satisfiedInvariants ?? [],
     ...ifDefined('refName', decision.refName),
     selectedPath: decision.selectedPath.map((entry) => ({
       dirName: entry.dirName,
       migrationHash: entry.migrationHash,
       from: entry.from,
       to: entry.to,
+      invariants: entry.invariants,
     })),
   };
 }

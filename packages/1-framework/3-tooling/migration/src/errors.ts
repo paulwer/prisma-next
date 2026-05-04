@@ -1,3 +1,4 @@
+import { ifDefined } from '@prisma-next/utils/defined';
 import { basename, dirname, relative } from 'pathe';
 
 /**
@@ -151,12 +152,12 @@ export function errorSameSourceAndTarget(dir: string, hash: string): MigrationTo
   const dirName = basename(dir);
   return new MigrationToolsError(
     'MIGRATION.SAME_SOURCE_AND_TARGET',
-    'Migration has same source and target',
+    'Migration without data-transform operations has same source and target',
     {
-      why: `Migration "${dirName}" has from === to === "${hash}". A migration must transition between two different contract states.`,
+      why: `Migration "${dirName}" has from === to === "${hash}" and declares no data-transform operations. Self-edges are only allowed when the migration runs at least one dataTransform — otherwise the migration is a no-op.`,
       fix: reemitHint(
         dir,
-        'or delete the directory if the migration is unwanted and the source TypeScript is gone.',
+        'and either change the contract so from ≠ to, add a dataTransform op, or delete the directory if the migration is unwanted.',
       ),
       details: { dirName, hash },
     },
@@ -291,6 +292,74 @@ export function errorProvidedInvariantsMismatch(
       why,
       fix: reemitHint(dirname(filePath), 'or restore the directory from version control.'),
       details: { filePath, stored, derived, difference: { missing, extra } },
+    },
+  );
+}
+
+/**
+ * Wire-shape edge surfaced through the JSON envelope's
+ * `meta.structuralPath` of `MIGRATION.NO_INVARIANT_PATH`. Slim by design —
+ * authoring metadata (`createdAt`, `labels`) lives on `MigrationEdge` but
+ * is intentionally dropped here so the envelope stays stable across
+ * graph-internal refactors.
+ *
+ * Stability: any field added here is part of the public CLI JSON contract.
+ * Callers (CLI consumers, agents) must be able to treat
+ * `(dirName, migrationHash, from, to, invariants)` as the canonical shape.
+ */
+export interface NoInvariantPathStructuralEdge {
+  readonly dirName: string;
+  readonly migrationHash: string;
+  readonly from: string;
+  readonly to: string;
+  readonly invariants: readonly string[];
+}
+
+export function errorNoInvariantPath(args: {
+  readonly refName?: string;
+  readonly required: readonly string[];
+  readonly missing: readonly string[];
+  readonly structuralPath: readonly NoInvariantPathStructuralEdge[];
+}): MigrationToolsError {
+  const { refName, required, missing, structuralPath } = args;
+  const refClause = refName ? `Ref "${refName}"` : 'Target';
+  const missingList = missing.map((id) => JSON.stringify(id)).join(', ');
+  const requiredList = required.map((id) => JSON.stringify(id)).join(', ');
+  return new MigrationToolsError(
+    'MIGRATION.NO_INVARIANT_PATH',
+    'No path covers the required invariants',
+    {
+      why: `${refClause} requires invariants the reachable path doesn't cover. required=[${requiredList}], missing=[${missingList}].`,
+      fix: 'Add a migration on the path that runs `dataTransform({ invariantId: "<id>", … })` for each missing invariant, or retarget the ref to a hash whose path already provides them.',
+      details: {
+        required,
+        missing,
+        structuralPath,
+        ...ifDefined('refName', refName),
+      },
+    },
+  );
+}
+
+export function errorUnknownInvariant(args: {
+  readonly refName?: string;
+  readonly unknown: readonly string[];
+  readonly declared: readonly string[];
+}): MigrationToolsError {
+  const { refName, unknown, declared } = args;
+  const refClause = refName ? `Ref "${refName}" declares` : 'Declares';
+  const unknownList = unknown.map((id) => JSON.stringify(id)).join(', ');
+  return new MigrationToolsError(
+    'MIGRATION.UNKNOWN_INVARIANT',
+    'Ref declares invariants no migration in the graph provides',
+    {
+      why: `${refClause} invariants no migration in the graph provides. unknown=[${unknownList}].`,
+      fix: 'Either the ref has a typo, or the declaring migration has not been authored/attested yet. Re-check the ref file and the migrations directory.',
+      details: {
+        unknown,
+        declared,
+        ...ifDefined('refName', refName),
+      },
     },
   );
 }
