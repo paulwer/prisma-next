@@ -35,11 +35,13 @@ import {
   type ForeignKeyNode,
   type IndexNode,
   type ModelNode,
+  type PrimaryKeyNode,
   type UniqueConstraintNode,
 } from '@prisma-next/sql-contract-ts/contract-builder';
 import { ifDefined } from '@prisma-next/utils/defined';
 import { notOk, ok, type Result } from '@prisma-next/utils/result';
 import {
+  findDuplicateFieldName,
   getAttribute,
   getPositionalArgument,
   mapFieldNamesToColumns,
@@ -464,18 +466,24 @@ function buildModelNodeFromPsl(input: BuildModelNodeInput): BuildModelNodeResult
     scalarTypeDescriptors: input.scalarTypeDescriptors,
   });
 
-  const primaryKeyFields = resolvedFields.filter((field) => field.isId);
-  const primaryKeyColumns = primaryKeyFields.map((field) => field.columnName);
-  const primaryKeyName = primaryKeyFields.length === 1 ? primaryKeyFields[0]?.idName : undefined;
-  const isVariantModel = model.attributes.some((attr) => attr.name === 'base');
-  if (primaryKeyColumns.length === 0 && !isVariantModel) {
+  const inlineIdFields = resolvedFields.filter((field) => field.isId);
+  if (inlineIdFields.length > 1) {
     diagnostics.push({
-      code: 'PSL_MISSING_PRIMARY_KEY',
-      message: `Model "${model.name}" must declare at least one @id field for SQL provider`,
+      code: 'PSL_INVALID_ATTRIBUTE_ARGUMENT',
+      message: `Model "${model.name}" cannot declare inline @id on multiple fields; use model-level @@id([...]) for composite identity`,
       sourceId,
       span: model.span,
     });
   }
+  const singleInlineIdField = inlineIdFields.length === 1 ? inlineIdFields[0] : undefined;
+  let primaryKey: PrimaryKeyNode | undefined = singleInlineIdField
+    ? {
+        columns: [singleInlineIdField.columnName],
+        ...ifDefined('name', singleInlineIdField.idName),
+      }
+    : undefined;
+  const hasInlinePrimaryKey = primaryKey !== undefined;
+  let blockPrimaryKeyDeclared = false;
 
   const resultBackrelationCandidates: ModelBackrelationCandidate[] = [];
   for (const field of model.fields) {
@@ -562,15 +570,57 @@ function buildModelNodeFromPsl(input: BuildModelNodeInput): BuildModelNodeResult
     if (modelAttribute.name === 'discriminator' || modelAttribute.name === 'base') {
       continue;
     }
-    if (modelAttribute.name === 'unique' || modelAttribute.name === 'index') {
+    const attributeLabel = `Model "${model.name}" @@${modelAttribute.name}`;
+    if (modelAttribute.name === 'id') {
+      if (blockPrimaryKeyDeclared) {
+        diagnostics.push({
+          code: 'PSL_INVALID_ATTRIBUTE_ARGUMENT',
+          message: `Model "${model.name}" declares @@id more than once`,
+          sourceId,
+          span: modelAttribute.span,
+        });
+        continue;
+      }
+      if (hasInlinePrimaryKey) {
+        diagnostics.push({
+          code: 'PSL_INVALID_ATTRIBUTE_ARGUMENT',
+          message: `Model "${model.name}" cannot declare both field-level @id and model-level @@id`,
+          sourceId,
+          span: modelAttribute.span,
+        });
+        blockPrimaryKeyDeclared = true;
+        continue;
+      }
       const fieldNames = parseAttributeFieldList({
         attribute: modelAttribute,
         sourceId,
         diagnostics,
         code: 'PSL_INVALID_ATTRIBUTE_ARGUMENT',
-        messagePrefix: `Model "${model.name}" @@${modelAttribute.name}`,
+        entityLabel: attributeLabel,
       });
       if (!fieldNames) {
+        continue;
+      }
+      const duplicateFieldName = findDuplicateFieldName(fieldNames);
+      if (duplicateFieldName !== undefined) {
+        diagnostics.push({
+          code: 'PSL_INVALID_ATTRIBUTE_ARGUMENT',
+          message: `${attributeLabel} list contains duplicate field "${duplicateFieldName}"`,
+          sourceId,
+          span: modelAttribute.span,
+        });
+        continue;
+      }
+      const nullableFieldName = fieldNames.find(
+        (name) => model.fields.find((f) => f.name === name)?.optional === true,
+      );
+      if (nullableFieldName !== undefined) {
+        diagnostics.push({
+          code: 'PSL_INVALID_ATTRIBUTE_ARGUMENT',
+          message: `${attributeLabel} cannot include optional field "${nullableFieldName}"; primary key columns must be NOT NULL`,
+          sourceId,
+          span: modelAttribute.span,
+        });
         continue;
       }
       const columnNames = mapFieldNamesToColumns({
@@ -580,7 +630,7 @@ function buildModelNodeFromPsl(input: BuildModelNodeInput): BuildModelNodeResult
         sourceId,
         diagnostics,
         span: modelAttribute.span,
-        contextLabel: `Model "${model.name}" @@${modelAttribute.name}`,
+        entityLabel: attributeLabel,
       });
       if (!columnNames) {
         continue;
@@ -589,7 +639,55 @@ function buildModelNodeFromPsl(input: BuildModelNodeInput): BuildModelNodeResult
         attribute: modelAttribute,
         sourceId,
         diagnostics,
-        entityLabel: `Model "${model.name}" @@${modelAttribute.name}`,
+        entityLabel: attributeLabel,
+        span: modelAttribute.span,
+        code: 'PSL_INVALID_ATTRIBUTE_ARGUMENT',
+      });
+      primaryKey = {
+        columns: columnNames,
+        ...ifDefined('name', constraintName),
+      };
+      blockPrimaryKeyDeclared = true;
+      continue;
+    }
+    if (modelAttribute.name === 'unique' || modelAttribute.name === 'index') {
+      const fieldNames = parseAttributeFieldList({
+        attribute: modelAttribute,
+        sourceId,
+        diagnostics,
+        code: 'PSL_INVALID_ATTRIBUTE_ARGUMENT',
+        entityLabel: attributeLabel,
+      });
+      if (!fieldNames) {
+        continue;
+      }
+      const duplicateFieldName = findDuplicateFieldName(fieldNames);
+      if (duplicateFieldName !== undefined) {
+        diagnostics.push({
+          code: 'PSL_INVALID_ATTRIBUTE_ARGUMENT',
+          message: `${attributeLabel} list contains duplicate field "${duplicateFieldName}"`,
+          sourceId,
+          span: modelAttribute.span,
+        });
+        continue;
+      }
+      const columnNames = mapFieldNamesToColumns({
+        modelName: model.name,
+        fieldNames,
+        mapping,
+        sourceId,
+        diagnostics,
+        span: modelAttribute.span,
+        entityLabel: attributeLabel,
+      });
+      if (!columnNames) {
+        continue;
+      }
+      const constraintName = parseConstraintMapArgument({
+        attribute: modelAttribute,
+        sourceId,
+        diagnostics,
+        entityLabel: attributeLabel,
         span: modelAttribute.span,
         code: 'PSL_INVALID_ATTRIBUTE_ARGUMENT',
       });
@@ -687,7 +785,7 @@ function buildModelNodeFromPsl(input: BuildModelNodeInput): BuildModelNodeResult
       sourceId,
       diagnostics,
       span: relationAttribute.relation.span,
-      contextLabel: `Relation field "${model.name}.${relationAttribute.field.name}"`,
+      entityLabel: `Relation field "${model.name}.${relationAttribute.field.name}"`,
     });
     if (!localColumns) {
       continue;
@@ -699,7 +797,7 @@ function buildModelNodeFromPsl(input: BuildModelNodeInput): BuildModelNodeResult
       sourceId,
       diagnostics,
       span: relationAttribute.relation.span,
-      contextLabel: `Relation field "${model.name}.${relationAttribute.field.name}"`,
+      entityLabel: `Relation field "${model.name}.${relationAttribute.field.name}"`,
     });
     if (!referencedColumns) {
       continue;
@@ -773,14 +871,7 @@ function buildModelNodeFromPsl(input: BuildModelNodeInput): BuildModelNodeResult
         ...ifDefined('default', resolvedField.defaultValue),
         ...ifDefined('executionDefaults', resolvedField.executionDefaults),
       })),
-      ...(primaryKeyColumns.length > 0
-        ? {
-            id: {
-              columns: primaryKeyColumns,
-              ...ifDefined('name', primaryKeyName),
-            },
-          }
-        : {}),
+      ...ifDefined('id', primaryKey),
       ...(uniqueConstraints.length > 0 ? { uniques: uniqueConstraints } : {}),
       ...(indexNodes.length > 0 ? { indexes: indexNodes } : {}),
       ...(foreignKeyNodes.length > 0 ? { foreignKeys: foreignKeyNodes } : {}),
