@@ -1,5 +1,6 @@
 import {
   checkAborted,
+  isRuntimeError,
   raceAgainstAbort,
   runtimeError,
 } from '@prisma-next/framework-components/runtime';
@@ -122,6 +123,14 @@ async function encodeParamValue(
   try {
     return await codec.encode(value, ctx);
   } catch (error) {
+    // Any `runtimeError`-built envelope is stable by construction — let
+    // it pass through unchanged. This covers codec-authored
+    // `RUNTIME.JSON_SCHEMA_VALIDATION_FAILED` (per-library JSON-with-
+    // schema codecs validate inside `encode` per ADR 208 § Case J),
+    // codec-authored `RUNTIME.ENCODE_FAILED` (no double wrap), and any
+    // future stable code thrown from a codec body. Symmetric with the
+    // decode-side guard.
+    if (isRuntimeError(error)) throw error;
     wrapEncodeFailure(error, metadata, paramIndex, codec.id);
   }
 }

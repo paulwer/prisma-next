@@ -22,7 +22,7 @@ import {
   type ColumnSpec,
   column,
 } from '@prisma-next/framework-components/codec';
-import { runtimeError } from '@prisma-next/framework-components/runtime';
+import { isRuntimeError, runtimeError } from '@prisma-next/framework-components/runtime';
 import type { StandardSchemaV1 } from '@standard-schema/spec';
 import { ArkErrors, ark, type Type, type } from 'arktype';
 
@@ -68,21 +68,63 @@ function validateSchema<TInferred>(schema: ArktypeSchemaLike, value: unknown): T
   return result as TInferred;
 }
 
-function serializeToJsonSafe<TInferred>(
-  schema: ArktypeSchemaLike,
-  value: TInferred,
-): { wire: string; json: JsonValue } {
+function serializeWire<TInferred>(value: TInferred): string {
   const wire: string | undefined = JSON.stringify(value);
   if (typeof wire !== 'string') {
-    throw runtimeError(
-      'RUNTIME.JSON_SCHEMA_VALIDATION_FAILED',
+    throw new Error(
       `arktype-json value is not representable as JSON (codecId: ${ARKTYPE_JSON_CODEC_ID})`,
-      { codecId: ARKTYPE_JSON_CODEC_ID },
     );
   }
-  const json = JSON.parse(wire) as JsonValue;
-  validateSchema(schema, json);
-  return { wire, json };
+  return wire;
+}
+
+function serializeJson<TInferred>(value: TInferred): JsonValue {
+  // The stringify → parse round-trip both validates JSON-representability
+  // (matching `serializeWire`) and produces a deep-cloned `JsonValue` that
+  // strips class prototypes / `toJSON` side effects, so callers reading
+  // the in-memory `JsonValue` see exactly the shape that would round-trip
+  // through the database.
+  return JSON.parse(serializeWire(value)) as JsonValue;
+}
+
+function parseJsonText(wire: string): JsonValue | undefined {
+  try {
+    return JSON.parse(wire) as JsonValue;
+  } catch {
+    return undefined;
+  }
+}
+
+function decodeWireValue<TInferred>(
+  schema: ArktypeSchemaLike,
+  wire: string | JsonValue,
+): TInferred {
+  if (typeof wire !== 'string') return validateSchema<TInferred>(schema, wire);
+
+  // Try the wire as the literal value first. Under `pg` + `jsonb` (the
+  // documented native type), wire arrives already-parsed: a JSON object
+  // surfaces as a JS object, a JSON string surfaces as a JS string. For
+  // string columns that means the wire IS the user's value — including
+  // strings whose literal characters happen to start and end with `"`.
+  // A `"…"`-shape unwrap heuristic would silently truncate them (the
+  // 7-char `"hello"` would decode to the 5-char `hello`).
+  //
+  // Fall back to JSON.parse only when schema validation rejects the raw
+  // wire: that path covers object/array shapes received as raw JSON
+  // text (legacy `json` text-OID adapters, or any code path that hands
+  // us un-pre-parsed JSON).
+  try {
+    return validateSchema<TInferred>(schema, wire);
+  } catch (error) {
+    if (!isRuntimeError(error) || error.code !== 'RUNTIME.JSON_SCHEMA_VALIDATION_FAILED') {
+      throw error;
+    }
+    const parsed = parseJsonText(wire);
+    if (parsed === undefined) {
+      throw error;
+    }
+    return validateSchema<TInferred>(schema, parsed);
+  }
 }
 
 function rehydrateSchema(jsonIr: object): ArktypeSchemaLike {
@@ -117,7 +159,7 @@ function renderArktypeJsonOutputType(params: ArktypeJsonTypeParams): string {
 export class ArktypeJsonCodecClass<TInferred> extends CodecImpl<
   typeof ARKTYPE_JSON_CODEC_ID,
   readonly ['equality'],
-  string,
+  string | JsonValue,
   TInferred
 > {
   constructor(
@@ -128,15 +170,15 @@ export class ArktypeJsonCodecClass<TInferred> extends CodecImpl<
   }
 
   async encode(value: TInferred, _ctx: CodecCallContext): Promise<string> {
-    return serializeToJsonSafe(this.schema, value).wire;
+    return serializeWire(value);
   }
 
-  async decode(wire: string, _ctx: CodecCallContext): Promise<TInferred> {
-    return validateSchema<TInferred>(this.schema, JSON.parse(wire));
+  async decode(wire: string | JsonValue, _ctx: CodecCallContext): Promise<TInferred> {
+    return decodeWireValue<TInferred>(this.schema, wire);
   }
 
   encodeJson(value: TInferred): JsonValue {
-    return serializeToJsonSafe(this.schema, value).json;
+    return serializeJson(value);
   }
 
   decodeJson(json: JsonValue): TInferred {
@@ -149,10 +191,13 @@ const arktypeJsonParamsSchema = type({
   jsonIr: 'object',
 }) satisfies StandardSchemaV1<ArktypeJsonTypeParams>;
 
+const ARKTYPE_JSON_META = { db: { sql: { postgres: { nativeType: 'jsonb' } } } } as const;
+
 export class ArktypeJsonDescriptor extends CodecDescriptorImpl<ArktypeJsonTypeParams> {
   override readonly codecId = ARKTYPE_JSON_CODEC_ID;
   override readonly traits = ['equality'] as const;
   override readonly targetTypes = [ARKTYPE_JSON_NATIVE_TYPE] as const;
+  override readonly meta = ARKTYPE_JSON_META;
   override readonly paramsSchema: StandardSchemaV1<ArktypeJsonTypeParams> = arktypeJsonParamsSchema;
   override renderOutputType(params: ArktypeJsonTypeParams): string {
     return renderArktypeJsonOutputType(params);
@@ -161,14 +206,18 @@ export class ArktypeJsonDescriptor extends CodecDescriptorImpl<ArktypeJsonTypePa
     params: ArktypeJsonTypeParams,
   ): (ctx: CodecInstanceContext) => ArktypeJsonCodecClass<unknown> {
     const schema = rehydrateSchema(params.jsonIr);
-    /* c8 ignore start — defensive parity check; not exercised by typical contracts */
     const rehydratedExpression = (schema as { readonly expression?: unknown }).expression;
     if (typeof rehydratedExpression === 'string' && rehydratedExpression !== params.expression) {
-      console.warn(
-        `[arktype-json] typeParams.expression (${params.expression}) does not match rehydrated schema expression (${rehydratedExpression}); contract.json may be stale relative to the runtime schema.`,
+      throw runtimeError(
+        'RUNTIME.TYPE_PARAMS_INVALID',
+        `arktype-json: typeParams.expression (${params.expression}) does not match the rehydrated schema's expression (${rehydratedExpression}). The contract was likely emitted against a different arktype version or hand-edited; re-run \`pnpm emit\` to regenerate.`,
+        {
+          codecId: ARKTYPE_JSON_CODEC_ID,
+          serializedExpression: params.expression,
+          rehydratedExpression,
+        },
       );
     }
-    /* c8 ignore stop */
     return () => new ArktypeJsonCodecClass<unknown>(this, schema);
   }
 }

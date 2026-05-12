@@ -275,6 +275,37 @@ describe('ContractCodecRegistry', () => {
 
     expect(context.contractCodecs.forCodecId('does-not-exist@1')).toBeUndefined();
   });
+
+  // Two parameterized columns with distinct typeParams resolve to two
+  // distinct codec instances under the same codec id. By default that's
+  // ambiguous — `forCodecId` rejects rather than silently bind to the
+  // first registered instance.
+  it('forCodecId throws RUNTIME.TYPE_PARAMS_INVALID when multiple distinct instances share a parameterized codec id', () => {
+    const contract = createTestContract({
+      Doc: {
+        small: {
+          nativeType: 'vector',
+          codecId: 'pg/vector@1',
+          nullable: false,
+          typeParams: { length: 768 },
+        },
+        large: {
+          nativeType: 'vector',
+          codecId: 'pg/vector@1',
+          nullable: false,
+          typeParams: { length: 1536 },
+        },
+      },
+    });
+
+    const context = createTestContext(contract, createStubAdapter(), {
+      extensionPacks: [createVectorExtensionDescriptor()],
+    });
+
+    expect(() => context.contractCodecs.forCodecId('pg/vector@1')).toThrow(
+      /resolves to multiple parameterized instances/,
+    );
+  });
 });
 
 describe('CodecDescriptorRegistry', () => {

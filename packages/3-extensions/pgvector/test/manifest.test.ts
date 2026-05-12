@@ -1,6 +1,8 @@
 import { timeouts } from '@prisma-next/test-utils';
 import { describe, expect, it } from 'vitest';
+import { VECTOR_CODEC_ID } from '../src/core/constants';
 import { pgvectorExtensionDescriptor } from '../src/exports/control';
+import pgvectorRuntimeDescriptor from '../src/exports/runtime';
 
 describe('pgvector descriptor', () => {
   it('has correct metadata', () => {
@@ -41,4 +43,12 @@ describe('pgvector descriptor', () => {
     },
     timeouts.typeScriptCompilation,
   );
+
+  it('parameterized vector descriptor does not expose encode fallback opt-out metadata', () => {
+    const vectorDescriptor = pgvectorRuntimeDescriptor
+      .codecs()
+      .find((descriptor) => descriptor.codecId === VECTOR_CODEC_ID);
+    expect(vectorDescriptor).toBeDefined();
+    expect(vectorDescriptor).not.toHaveProperty('encodeIsParamsIndependent');
+  });
 });

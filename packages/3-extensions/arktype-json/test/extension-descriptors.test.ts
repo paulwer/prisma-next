@@ -1,3 +1,4 @@
+import { extractCodecLookup } from '@prisma-next/framework-components/control';
 import { describe, expect, it } from 'vitest';
 import { ARKTYPE_JSON_CODEC_ID, arktypeJsonDescriptor } from '../src/core/arktype-json-codec';
 import { arktypeJsonExtensionDescriptor } from '../src/exports/control';
@@ -23,6 +24,33 @@ describe('arktypeJsonRuntimeDescriptor', () => {
     const instance = arktypeJsonRuntimeDescriptor.create();
     expect(instance.familyId).toBe('sql');
     expect(instance.targetId).toBe('postgres');
+  });
+
+  it('exposes arktype/json@1 metadata through types.codecTypes.codecDescriptors', () => {
+    const codecDescriptors = arktypeJsonRuntimeDescriptor.types?.codecTypes?.codecDescriptors;
+    expect(codecDescriptors).toContain(arktypeJsonDescriptor);
+  });
+
+  it('extractCodecLookup over the runtime descriptor resolves arktype/json@1 metadata', () => {
+    const lookup = extractCodecLookup([arktypeJsonRuntimeDescriptor]);
+    const meta = lookup.metaFor(ARKTYPE_JSON_CODEC_ID) as
+      | {
+          readonly db?: { readonly sql?: { readonly postgres?: { readonly nativeType?: string } } };
+        }
+      | undefined;
+    expect(lookup.targetTypesFor(ARKTYPE_JSON_CODEC_ID)).toEqual(['jsonb']);
+    expect(meta?.db?.sql?.postgres?.nativeType).toBe('jsonb');
+    expect(
+      lookup.renderOutputTypeFor(ARKTYPE_JSON_CODEC_ID, {
+        expression: '{ name: string }',
+        jsonIr: {},
+      }),
+    ).toBe('{ name: string }');
+  });
+
+  it('does not materialize an id-keyed representative without concrete typeParams', () => {
+    const lookup = extractCodecLookup([arktypeJsonRuntimeDescriptor]);
+    expect(lookup.get(ARKTYPE_JSON_CODEC_ID)).toBeUndefined();
   });
 });
 

@@ -12,6 +12,7 @@
  * Negative tests cover the `ColumnHelperFor` typeParams-shape check.
  */
 
+import type { JsonValue } from '@prisma-next/contract/types';
 import {
   type Codec,
   type CodecInstanceContext,
@@ -71,6 +72,12 @@ test('arktypeJsonDescriptor: factory(params) returns erased ArktypeJsonCodecClas
   const factory = arktypeJsonDescriptor.factory({ expression: 'string', jsonIr: {} });
   expectTypeOf(factory).toEqualTypeOf<
     (ctx: CodecInstanceContext) => ArktypeJsonCodecClass<unknown>
+  >();
+});
+
+test('ArktypeJsonCodecClass accepts raw JSON text or pre-parsed JsonValue wire', () => {
+  expectTypeOf<ArktypeJsonCodecClass<unknown>>().toExtend<
+    Codec<'arktype/json@1', readonly ['equality'], string | JsonValue, unknown>
   >();
 });
 

@@ -207,7 +207,7 @@ Both problems share a root cause: the type-level facts about a parameterized col
 
 ### Per-library JSON extensions
 
-`@prisma-next/extension-arktype-json` ships `arktypeJson(schema)`. The codec id (`arktype/json@1`) is library-bound, not target-bound. The factory eagerly serializes `schema.expression` (TypeScript-source-like rendering) and `schema.json` (arktype's internal IR) into `typeParams` at the column-author site; the descriptor's factory rehydrates via `ark.schema(typeParams.jsonIr)` and validates internally in `decode`. The emit-path renderer reads `expression` directly so `contract.d.ts` carries the schema's source-like rendering with full fidelity.
+`@prisma-next/extension-arktype-json` ships `arktypeJson(schema)`. The codec id (`arktype/json@1`) is library-bound, not target-bound. The factory eagerly serializes `schema.expression` (TypeScript-source-like rendering) and `schema.json` (arktype's internal IR) into `typeParams` at the column-author site; the descriptor's factory rehydrates via `ark.schema(typeParams.jsonIr)`, fails fast if the rehydrated expression diverges, and validates internally in `decode`. The no-emit resolver and emit-path renderer read the factory return type / `expression` so `contract.d.ts` carries the schema's source-like rendering with full fidelity.
 
 The postgres adapter retains only the non-parameterized raw-JSON / raw-JSONB codecs (`pg/json@1`, `pg/jsonb@1`) — schema-typed JSON columns ship from extension packages. Future per-library extensions (`zod/json@1`, `valibot/json@1`) follow the same pattern when each library has a clean serialize / rehydrate story.
 

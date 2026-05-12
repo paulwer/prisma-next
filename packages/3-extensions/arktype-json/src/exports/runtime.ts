@@ -16,6 +16,11 @@ export const arktypeJsonRuntimeDescriptor: SqlRuntimeExtensionDescriptor<'postgr
   version: arktypeJsonPackMeta.version,
   familyId: 'sql' as const,
   targetId: 'postgres' as const,
+  types: {
+    codecTypes: {
+      codecDescriptors: Array.from(arktypeJsonCodecRegistry.values()),
+    },
+  },
   codecs: () => Array.from(arktypeJsonCodecRegistry.values()),
   create() {
     return {
