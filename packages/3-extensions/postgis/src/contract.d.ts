@@ -24,6 +24,7 @@ import type {
 import type {
   Contract as ContractType,
   ExecutionHashBase,
+  NamespaceId,
   ProfileHashBase,
   StorageHashBase,
 } from '@prisma-next/contract/types';
@@ -50,30 +51,33 @@ export type TypeMaps = TypeMapsType<
   FieldInputTypes
 >;
 
-type ContractBase = ContractType<
-  {
-    readonly namespaces: {
-      readonly __unbound__: {
-        readonly id: '__unbound__';
-        readonly kind: 'sql-namespace';
-        readonly tables: {};
+type ContractBase = Omit<
+  ContractType<
+    {
+      readonly namespaces: {
+        readonly __unbound__: {
+          readonly id: '__unbound__';
+          readonly kind: 'sql-namespace';
+          readonly tables: {};
+        };
       };
-    };
-    readonly types: {
-      readonly geometry: {
-        readonly kind: 'codec-instance';
-        readonly codecId: 'pg/geometry@1';
-        readonly nativeType: 'geometry';
-        readonly typeParams: Record<string, never>;
+      readonly types: {
+        readonly geometry: {
+          readonly kind: 'codec-instance';
+          readonly codecId: 'pg/geometry@1';
+          readonly nativeType: 'geometry';
+          readonly typeParams: Record<string, never>;
+        };
       };
-    };
-    readonly storageHash: StorageHash;
-  },
-  Record<string, never>
+      readonly storageHash: StorageHash;
+    },
+    Record<string, never>
+  >,
+  'roots'
 > & {
   readonly target: 'postgres';
   readonly targetFamily: 'sql';
-  readonly roots: Record<string, string>;
+  readonly roots: Record<string, never>;
   readonly capabilities: {
     readonly postgres: {
       readonly distinctOn: true;
