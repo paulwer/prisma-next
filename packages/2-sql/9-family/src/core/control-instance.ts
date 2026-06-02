@@ -35,14 +35,11 @@ import { sqlContractCanonicalizationHooks } from '@prisma-next/sql-contract/cano
 import type { SqlStorage } from '@prisma-next/sql-contract/types';
 import type {
   AnyQueryAst,
+  DdlNode,
   LoweredStatement,
   LowererContext,
 } from '@prisma-next/sql-relational-core/ast';
-import {
-  ensureSchemaStatement,
-  ensureTableStatement,
-  writeContractMarker,
-} from '@prisma-next/sql-runtime';
+import { writeContractMarker } from '@prisma-next/sql-runtime';
 import { defaultIndexName } from '@prisma-next/sql-schema-ir/naming';
 import type { SqlSchemaIR, SqlTableIR } from '@prisma-next/sql-schema-ir/types';
 import { ifDefined } from '@prisma-next/utils/defined';
@@ -245,7 +242,11 @@ export interface SqlControlFamilyInstance
 
   inferPslContract(schemaIR: SqlSchemaIR): PslDocumentAst;
 
-  lowerAst(ast: AnyQueryAst, context: LowererContext<unknown>): LoweredStatement;
+  lowerAst(ast: AnyQueryAst | DdlNode, context: LowererContext<unknown>): LoweredStatement;
+
+  bootstrapControlTableQueries(): readonly DdlNode[];
+
+  bootstrapSignMarkerQueries(): readonly DdlNode[];
 
   toOperationPreview(operations: readonly MigrationPlanOperation[]): OperationPreview;
 }
@@ -540,10 +541,14 @@ export function createSqlFamilyInstance<TTargetId extends string>(
           : contractStorageHash;
       const contractTarget = contract.target;
 
-      await driver.query(ensureSchemaStatement.sql, ensureSchemaStatement.params);
-      await driver.query(ensureTableStatement.sql, ensureTableStatement.params);
+      const controlAdapter = getControlAdapter();
+      const lowererContext = { contract };
+      for (const query of controlAdapter.bootstrapSignMarkerQueries()) {
+        const lowered = controlAdapter.lower(query, lowererContext);
+        await driver.query(lowered.sql, lowered.params);
+      }
 
-      const existingMarker = await getControlAdapter().readMarker(driver, APP_SPACE_ID);
+      const existingMarker = await controlAdapter.readMarker(driver, APP_SPACE_ID);
 
       let markerCreated = false;
       let markerUpdated = false;
@@ -647,8 +652,16 @@ export function createSqlFamilyInstance<TTargetId extends string>(
       return sqlSchemaIrToPslAst(schemaIR);
     },
 
-    lowerAst(ast: AnyQueryAst, context: LowererContext<unknown>): LoweredStatement {
+    lowerAst(ast: AnyQueryAst | DdlNode, context: LowererContext<unknown>): LoweredStatement {
       return getControlAdapter().lower(ast, context);
+    },
+
+    bootstrapControlTableQueries(): readonly DdlNode[] {
+      return getControlAdapter().bootstrapControlTableQueries();
+    },
+
+    bootstrapSignMarkerQueries(): readonly DdlNode[] {
+      return getControlAdapter().bootstrapSignMarkerQueries();
     },
 
     toOperationPreview(operations: readonly MigrationPlanOperation[]): OperationPreview {

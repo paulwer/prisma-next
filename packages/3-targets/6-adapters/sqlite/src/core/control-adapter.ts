@@ -9,9 +9,11 @@ import {
 import { ledgerOriginFromStored } from '@prisma-next/migration-tools/ledger-origin';
 import type {
   AnyQueryAst,
+  DdlNode,
   LoweredStatement,
   LowererContext,
 } from '@prisma-next/sql-relational-core/ast';
+import { isDdlNode } from '@prisma-next/sql-relational-core/ast';
 import type {
   PrimaryKey,
   SqlColumnIR,
@@ -22,10 +24,16 @@ import type {
   SqlTableIR,
   SqlUniqueIR,
 } from '@prisma-next/sql-schema-ir/types';
+import {
+  buildControlTableBootstrapQueries,
+  buildSignMarkerBootstrapQueries,
+} from '@prisma-next/target-sqlite/contract-free';
+import type { SqliteDdlNode } from '@prisma-next/target-sqlite/ddl';
 import { parseSqliteDefault } from '@prisma-next/target-sqlite/default-normalizer';
 import { normalizeSqliteNativeType } from '@prisma-next/target-sqlite/native-type-normalizer';
 import { ifDefined } from '@prisma-next/utils/defined';
 import { renderLoweredSql } from './adapter';
+import { renderLoweredDdl } from './ddl-renderer';
 import { coerceLedgerAppliedAt, operationCountFromStored } from './ledger-decode';
 import type { SqliteContract } from './types';
 
@@ -104,6 +112,14 @@ export class SqliteControlAdapter implements SqlControlAdapter<'sqlite'> {
   readonly normalizeDefault = parseSqliteDefault;
   readonly normalizeNativeType = normalizeSqliteNativeType;
 
+  bootstrapControlTableQueries(): readonly DdlNode[] {
+    return buildControlTableBootstrapQueries();
+  }
+
+  bootstrapSignMarkerQueries(): readonly DdlNode[] {
+    return buildSignMarkerBootstrapQueries();
+  }
+
   /**
    * Lower a SQL query AST into a SQLite-flavored `{ sql, params }` payload.
    *
@@ -112,7 +128,10 @@ export class SqliteControlAdapter implements SqlControlAdapter<'sqlite'> {
    * and contract. Used at migration plan/emit time (e.g. by `dataTransform`)
    * without instantiating the runtime adapter.
    */
-  lower(ast: AnyQueryAst, context: LowererContext<unknown>): LoweredStatement {
+  lower(ast: AnyQueryAst | SqliteDdlNode, context: LowererContext<unknown>): LoweredStatement {
+    if (isDdlNode(ast)) {
+      return renderLoweredDdl(ast);
+    }
     return renderLoweredSql(ast, context.contract as SqliteContract);
   }
 

@@ -11,6 +11,7 @@ import type {
 import type { PostgresEnumStorageEntry, SqlStorage } from '@prisma-next/sql-contract/types';
 import type {
   AnyQueryAst,
+  DdlNode,
   LoweredStatement,
   LowererContext,
 } from '@prisma-next/sql-relational-core/ast';
@@ -126,6 +127,18 @@ export interface SqlControlAdapter<TTarget extends string = string>
   ) => readonly string[] | null;
 
   /**
+   * Ordered DDL queries that bootstrap marker/ledger control tables for migration
+   * runners. Postgres includes `CREATE SCHEMA`; SQLite does not.
+   */
+  bootstrapControlTableQueries(): readonly DdlNode[];
+
+  /**
+   * Ordered DDL queries that bootstrap the marker table (and Postgres schema) for
+   * `sign` — excludes the ledger table.
+   */
+  bootstrapSignMarkerQueries(): readonly DdlNode[];
+
+  /**
    * Lower a SQL query AST into a target-flavored `{ sql, params }` payload.
    *
    * Migration tooling (e.g. the `dataTransform` operation) needs to materialize
@@ -134,7 +147,7 @@ export interface SqlControlAdapter<TTarget extends string = string>
    * same AST and contract, ensuring planned SQL matches what the runtime would
    * emit.
    */
-  lower(ast: AnyQueryAst, context: LowererContext<unknown>): LoweredStatement;
+  lower(ast: AnyQueryAst | DdlNode, context: LowererContext<unknown>): LoweredStatement;
 }
 
 /**
