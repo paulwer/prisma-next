@@ -21,10 +21,10 @@ import { loadConfig } from '../config-loader';
 import { createControlClient } from '../control-api/client';
 import {
   CliStructuredError,
-  errorDatabaseConnectionRequired,
   errorUnexpected,
   mapMigrationToolsError,
   mapRefResolutionError,
+  requireLiveDatabase,
 } from '../utils/cli-errors';
 import {
   addGlobalOptions,
@@ -76,6 +76,7 @@ interface MigrationStatusOptions extends CommonCommandOptions {
   readonly from?: string;
   readonly space?: string;
   readonly legend?: boolean;
+  readonly ascii?: boolean;
 }
 
 export interface MigrationStatusMigrationEntry extends MigrationListEntry {
@@ -271,13 +272,16 @@ async function executeMigrationStatusCommand(
   const hasDriver = !!config.driver;
   const usingFromOverride = options.from !== undefined;
 
-  if (!usingFromOverride && (!dbConnection || !hasDriver)) {
-    return notOk(
-      errorDatabaseConnectionRequired({
-        why: 'migration status needs a database connection to read the marker and ledger (or pass --from for offline path preview)',
-        retryCommand: 'prisma-next migration status --from <contract>',
-      }),
-    );
+  if (!usingFromOverride) {
+    const missingDb = requireLiveDatabase({
+      dbConnection,
+      hasDriver,
+      why: 'migration status needs a database connection to read the marker and ledger (or pass --from for offline path preview)',
+      retryCommand: 'prisma-next migration status --from <contract>',
+    });
+    if (missingDb) {
+      return notOk(missingDb);
+    }
   }
 
   let allRefs: Refs = {};
@@ -374,7 +378,7 @@ async function executeMigrationStatusCommand(
       ui.stderr(
         renderMigrationGraphLegend({
           colorize: flags.color !== false,
-          glyphMode: ui.resolveGlyphMode(false),
+          glyphMode: ui.resolveGlyphMode(options.ascii === true),
         }),
       );
       ui.stderr('');
@@ -449,7 +453,7 @@ async function executeMigrationStatusCommand(
 
   const showAppliedOverlay = connected && !usingFromOverride;
   const showDbMarker = connected && !usingFromOverride;
-  const glyphMode = ui.resolveGlyphMode(false);
+  const glyphMode = ui.resolveGlyphMode(options.ascii === true);
   const colorize = flags.color !== false;
 
   const statusSpaces: MigrationStatusSpaceResult[] = [];
@@ -630,7 +634,8 @@ export function createMigrationStatusCommand(): Command {
     command,
     'Show migration path and pending status',
     'Shows which migrations are pending between the database marker and\n' +
-      'the target contract. Requires a database connection for live status.\n' +
+      'the target contract. Requires a database connection.\n' +
+      'Pass --from for an offline path preview without a database.\n' +
       'Use `migration graph` for topology, `migration log` for history,\n' +
       'and `migration list` for on-disk enumeration.',
   );
@@ -638,6 +643,8 @@ export function createMigrationStatusCommand(): Command {
     'prisma-next migration status --db $DATABASE_URL',
     'prisma-next migration status --to production --db $DATABASE_URL',
     'prisma-next migration status --from sha256:abc --to production',
+    'prisma-next migration status --from sha256:abc --to production --json',
+    'prisma-next migration status --ascii --from sha256:abc --to production',
     'prisma-next migration status --legend --from sha256:abc --to production',
   ]);
   setCommandSeeAlso(command, [
@@ -659,6 +666,7 @@ export function createMigrationStatusCommand(): Command {
       'Origin contract reference; same grammar as --to. Supplying --from switches to offline path computation.',
     )
     .option('--legend', 'Print a key for the tree glyphs and lane colors')
+    .option('--ascii', 'Use ASCII glyphs (pipe-friendly)')
     .action(async (options: MigrationStatusOptions) => {
       const flags = parseGlobalFlagsOrExit(options);
       const ui = createTerminalUI(flags);
