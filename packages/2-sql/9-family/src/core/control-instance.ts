@@ -503,11 +503,20 @@ export function createSqlFamilyInstance<TTargetId extends string>(
     extensionPacks: extensions,
   });
 
-  // Family-instance methods accept `SqlControlDriverInstance<string>` — the
-  // family API isn't generic on the target id. The adapter descriptor's `create`
-  // returns the concrete `SqlControlAdapter<TTargetId>`; widening the target id to
-  // `string` here matches the family-level driver type without a per-method probe.
-  const getControlAdapter = (): SqlControlAdapter<string> => adapter.create(stack);
+  // Lazily construct the control adapter on first use, then memoize it.
+  // Merely building a family instance must not instantiate the adapter —
+  // that would change the load/instantiate semantics of the whole stack
+  // wherever a family is created (every CLI command, emit, verify, …), not
+  // just the migration paths that actually need it. Memoizing also avoids
+  // the previous per-operation re-instantiation (a fresh adapter on every
+  // call). Family-instance methods accept `SqlControlDriverInstance<string>`
+  // (the family API isn't generic on the target id); the adapter
+  // descriptor's `create` returns the concrete `SqlControlAdapter<TTargetId>`,
+  // widened to `string` to match the family-level driver type without a
+  // per-method probe.
+  let controlAdapter: SqlControlAdapter<string> | undefined;
+  const getControlAdapter = (): SqlControlAdapter<string> =>
+    (controlAdapter ??= adapter.create(stack));
 
   const targetSerializer = (
     target as unknown as {

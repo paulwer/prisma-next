@@ -118,6 +118,47 @@ So the contract-free DML surface keeps full JS round-tripping (object ↔ `jsonb
     - **Each target package** defines its own `<Target>DdlVisitor<R>` (one method per kind that target has), a `<Target>DdlNode` abstract base (`extends DdlNode`) that declares `abstract accept<R>(v: <Target>DdlVisitor<R>): R`, and its concrete classes. Postgres: `PostgresDdlVisitor` (`createTable` + `createSchema`), `PostgresCreateTable`, `PostgresCreateSchema`. SQLite: `SqliteDdlVisitor` (`createTable`), `SqliteCreateTable`. No target stubs a kind it lacks. This mirrors the migration-op three-layer base (`PostgresOpFactoryCallNode` in `target-postgres/src/core/migrations/`) for placement + layering, combined with `ExprVisitor`-style double-dispatch.
     - **Adapter:** `lower(ast: AnyQueryAst | <Target>DdlNode, …)`; `isAnyDdlNode(ast)` narrows to `<Target>DdlNode` (the `AnyQueryAst` arm has no `DdlNode` member), then `ast.accept(new <Target>DdlVisitor())`. Impl-level signature widening (as the spike used) is sufficient and type-safe; formalizing the shared `Adapter` interface type-param is deferred unless a compile forces it.
   - **Columns:** `DdlColumn` gains `default?: ColumnDefault`, reusing the contract-authoring `ColumnDefault` vocabulary (sourced from `@prisma-next/contract/types` / the sql contract validators — **not** a new enum). Type stays an opaque native-type string.
+- **Table-level constraint shape on `CreateTable` — RESOLVED (D1 spike, validated end-to-end on both Postgres and SQLite):** a `constraints?: readonly DdlTableConstraint[]` field on `PostgresCreateTable` / `SqliteCreateTable`, where `DdlTableConstraint` is a frozen-class union of three kinds. The three classes live in `relational-core/src/ast/ddl-types.ts` and are exported from `@prisma-next/sql-relational-core/ast`:
+
+  ```ts
+  class PrimaryKeyConstraint {
+    readonly kind = 'primary-key';
+    readonly columns: ReadonlyArray<string>;
+    readonly name: string | undefined;    // present → CONSTRAINT <name> PRIMARY KEY (…)
+  }
+
+  class ForeignKeyConstraint {
+    readonly kind = 'foreign-key';
+    readonly columns: ReadonlyArray<string>;
+    readonly refTable: string;
+    readonly refColumns: ReadonlyArray<string>;
+    readonly onDelete: ReferentialAction | undefined;
+    readonly onUpdate: ReferentialAction | undefined;
+    readonly name: string | undefined;    // present → CONSTRAINT <name> FOREIGN KEY …
+  }
+
+  class UniqueConstraint {
+    readonly kind = 'unique';
+    readonly columns: ReadonlyArray<string>;
+    readonly name: string | undefined;    // present → CONSTRAINT <name> UNIQUE (…)
+  }
+
+  type DdlTableConstraint = PrimaryKeyConstraint | ForeignKeyConstraint | UniqueConstraint;
+  ```
+
+  Key decisions within this shape:
+
+  - **Array-of-frozen-sub-nodes.** Constraint objects are frozen on construction (same discipline as the `DdlNode` hierarchy). The array is frozen when stored on `CreateTable`. This matches the pattern used for `DdlColumn` and for `ReadonlyArray<DdlColumn>`.
+  - **`ReferentialAction` _type_ reused, not a new enum.** `onDelete` / `onUpdate` use the `ReferentialAction` type from `@prisma-next/sql-contract/types` (`'noAction' | 'restrict' | 'cascade' | 'setNull' | 'setDefault'`). Each adapter renderer currently **re-declares its own local** `REFERENTIAL_ACTION_SQL` action→SQL map (matching the pre-existing copies in the planner/operations code, e.g. `packages/3-targets/3-targets/postgres/src/core/migrations/operations/constraints.ts`) — there are now 5 identical copies repo-wide. The *type* is shared; the *map* is not. **D2 consolidates the map into one shared home** (see Open items). No parallel action vocabulary is introduced.
+  - **`constraints` is optional (absent = no table-level constraints).** When absent, the adapter renders only column defs. Existing `CreateTable` nodes with no table-level constraints (including the marker/ledger bootstrap tables) render byte-identical to before — verified by `pnpm fixtures:check`.
+  - **SQLite uses the same node shapes.** SQLite renders all three constraint kinds inline in the `CREATE TABLE` body, which is the only form SQLite supports. The same `DdlTableConstraint` classes are used; only the case (uppercase vs lowercase) and quoting in the rendered output differ from Postgres — the rendering is handled by the `SqliteDdlVisitorImpl`, not by target-specific node classes.
+  - **Constraint classes are `relational-core`-level, not per-target.** The three constraint kinds are universal across SQL targets; the per-target variation is entirely in how the adapter renders them (Postgres uses lowercase `create table` / unquoted column names; SQLite uses uppercase). This is the correct split: target owns the node (by including `constraints` on its `CreateTable`), adapter owns the rendering.
+
+  **Rejected alternatives:**
+  - **Inline constraint representation (column-level only, no table-level array).** Composite PKs cannot be expressed column-level. Adding `primaryKey: true` to multiple columns would require the renderer to aggregate them — that is stateful and requires a separate pass. Rejected: the array-of-constraint-objects keeps the rendering a simple fold.
+  - **`onDelete`/`onUpdate` as raw SQL strings.** Raw strings allow arbitrary values and don't typecheck against valid referential actions. Rejected: `ReferentialAction` is the established vocabulary; reuse beats a new enum.
+  - **Per-target constraint node classes.** The rendering differences between Postgres and SQLite (`create table` vs `CREATE TABLE`, no-schema vs `schema.table`) are in the DDL visitor, not in the constraint shape. Having `PostgresPrimaryKeyConstraint` / `SqlitePrimaryKeyConstraint` would duplicate identical shapes. Rejected: one shared class, per-adapter rendering.
+
 - **Migration adoption: reuse vs extract.** Whether the `*Call` factories build the query-AST DDL directly, or a thin shared DDL-construction helper sits between them. **Working position:** factories build query-AST DDL directly via the contract-free constructors; extract a helper only if duplication bites. Settled at the planner-adoption slice.
 - **Contract-free builder altitude + surface.** Where it lives (a module in `relational-core` beside the AST vs a dedicated package) and how much of the AST it covers in the first pass. **Working position:** beside the AST, covering exactly the marker/migration DDL+DML needs, widened as consumers demand. Settled at slice-planning time.
 - **DDL identifier quoting — Deferred to planner adoption; string-literal default escaping — done.** The contract-free DDL renderers emit identifiers (`schema`, `table`, column names/types) verbatim — no `quoteIdentifier`, unlike the DML renderer in the same adapter. This is safe and byte-correct for the foundational slice because its only consumer is control-plane bootstrap with fixed, trusted identifiers. Identifier quoting is **load-bearing only once the migration planner feeds user-derived identifiers through this path**, so it lands with the planner-adoption slice (which already owns dialect quoting via `buildColumnDefaultSql` and `sql-utils`). String-literal *default values*, by contrast, are now single-quote-escaped via the shared `escapeLiteral` (embedded `'` doubled) — byte-identical for the quote-free control-plane defaults, but injection-safe for any future quote-bearing value. The remaining identifier-quoting deferral is recorded as a precondition in the `createTable`/`createSchema` JSDoc rather than left implicit, so callers can't assume identifiers are quoted.
@@ -148,3 +189,30 @@ The Mongo slice is structurally unlike the SQL slices: Mongo has **no column/exp
 - ADRs: 021 (Contract Marker Storage), 190 (CAS concurrency, Mongo), 195 (Planner IR with two renderers), 198 (Runner decoupled via visitor SPIs), 204 (Domain actions vs composable primitives), 212 (Contract spaces).
 - Patterns: [`three-layer-polymorphic-ir.md`](../../docs/architecture%20docs/patterns/three-layer-polymorphic-ir.md), [`frozen-class-ast.md`](../../docs/architecture%20docs/patterns/frozen-class-ast.md), [`adapter-spi.md`](../../docs/architecture%20docs/patterns/adapter-spi.md).
 - Subsystems: [`5. Adapters & Targets`](../../docs/architecture%20docs/subsystems/5.%20Adapters%20%26%20Targets.md), [`7. Migration System`](../../docs/architecture%20docs/subsystems/7.%20Migration%20System.md)
+
+## Planner DDL lowering mechanism (D3) — RESOLVED
+
+**Question (a stop-condition that halted D3 round 1).** The planner's `CreateTableCall.toOp()` lives in the **target** package and must produce its `sql` by lowering a DDL-AST node. But lowering (`renderLoweredDdl`) was placed in the **adapter** package (slice 1), and `adapter-postgres` depends on `target-postgres` — so the target cannot import the adapter (circular). A first D3 attempt wrongly tried to **relocate** the renderer into the target (contradicting "the adapter owns lowering"); a runtime-lowering alternative would have changed the step contract the spec deferred.
+
+**Resolution (operator-confirmed, verified).** Neither relocate nor defer. The adapter **interface** `SqlControlAdapter<TTarget>` already lives in `@prisma-next/family-sql/control-adapter` (`packages/2-sql/9-family`) — a layer below both target and adapter, which both already depend on. It exposes `lower(ast: AnyQueryAst | DdlNode, ctx): LoweredStatement`. The migration class (`PostgresMigration extends SqlMigration`) holds the concrete adapter as `this.controlAdapter`, and the existing `dataTransform()` method is the proven pattern: it threads `this.controlAdapter` into a free operation factory that calls `adapter.lower(...)`. So `CreateTableCall.toOp()` receives the adapter (via the same threading), builds the node with the contract-free constructor, and lowers it through the interface **at plan/JSON-write time** (the op's `.sql` is finalized before serialization). The renderer stays in the adapter; "adapter owns lowering" holds; the target depends only on the low-level *interface*, never the concrete adapter.
+
+## Migration authoring API: SQL-free, builder-options methods (PR #751 revision)
+
+**Principle (operator).** The migration op factories are the user-facing authoring API. **No SQL may appear in that interface** — not `typeSql`/`defaultSql` fragments, not raw `sql` strings, not glued `CREATE TABLE …`. SQL is produced **only** by lowering a typed DDL node through the adapter, at one boundary.
+
+**Shape.** `createTable` / `createSchema` are **`Migration` methods** (mirroring the existing `dataTransform`) that take the contract-free builder's *options* and lower internally:
+
+```ts
+this.createTable({ schema: 'public', table: 'bug', columns: [col('severity', 'text', { notNull: true })], constraints: [primaryKey(['id'])] })
+this.createSchema({ schema: 'public' })
+```
+
+The method builds the `CreateTable` DDL node from the options (via the D1/D2 contract-free constructor), lowers it through `this.controlAdapter` (a `Lowerer` — a structural subset of `SqlControlAdapter`), and assembles the `Op` (precheck/postcheck derived from `schema`/`table`). The plan path (`CreateTableCall.toOp(lowerer)`) builds the same node from its `*Call` fields and feeds the **same** `buildCreateTableOp(node, lowerer)` assembler — one lowering implementation, no second renderer to keep byte-identical.
+
+**Why options, not the node, as the method input.** Passing the node forces `this.createTable(createTable({…}))` — repetition. Taking the builder's *options* fuses build + lower + assemble into one call. `col()` stays the column vocabulary; no `ColumnSpec` for createTable.
+
+**Consequences.** `createTableOp(sql)`, the `sql` parameter, the string-gluing, the `LowerFn` callback, the free `renderOps`, and the `blindCast` all disappear. The shared `ColumnSpec` reverts to its `origin/main` shape (the bolted-on `columnDefault` goes away — resolving the CodeRabbit leak), untouched and still used by `addColumn` et al. (their adoption is a follow-up slice).
+
+## The `*Call` op nodes are the common interface (PR #751 follow-up)
+
+Operator clarification: the `OpFactoryCall` IR nodes (`CreateTableCall`, `CreateSchemaCall`, …) **are** the single common interface for a migration operation. `toOp(lowerer)` is how a `*Call` renders itself into an `Op`; `renderTypeScript()` is how it renders its authoring source. There is no separate free `buildCreateTableOp(node, lowerer)` seam — the Op-assembly lives on `CreateTableCall.toOp()`. The two producers both go through the `*Call`: the planner constructs it during diffing; `PostgresMigration.createTable(options)` constructs one from the user's contract-free options and calls `.toOp(this.controlAdapter)`.

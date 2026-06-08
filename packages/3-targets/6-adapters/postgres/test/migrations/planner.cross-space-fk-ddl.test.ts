@@ -18,6 +18,9 @@ import type { SqlSchemaIR } from '@prisma-next/sql-schema-ir/types';
 import { createPostgresMigrationPlanner } from '@prisma-next/target-postgres/planner';
 import { applicationDomainOf } from '@prisma-next/test-utils';
 import { describe, expect, it } from 'vitest';
+import { createPostgresAdapter } from '../../src/core/adapter';
+
+const testAdapter = createPostgresAdapter();
 
 const emptySchema: SqlSchemaIR = { tables: {} };
 
@@ -140,7 +143,7 @@ function buildLocalFkContract(): Contract<SqlStorage> {
 }
 
 function planAndGetFkExecuteSql(contract: Contract<SqlStorage>): string {
-  const planner = createPostgresMigrationPlanner();
+  const planner = createPostgresMigrationPlanner(testAdapter);
   const result = planner.plan({
     contract,
     schema: emptySchema,

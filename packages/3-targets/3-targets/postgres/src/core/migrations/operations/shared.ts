@@ -7,9 +7,9 @@ import type { OperationClass, PostgresPlanTargetDetails } from '../planner-targe
 export type Op = SqlMigrationPlanOperation<PostgresPlanTargetDetails>;
 
 /**
- * Literal-args shape for a column definition consumed by `createTable` and
- * `addColumn`. Fully materialized: codec expansion and default rendering have
- * already happened in the wrapper.
+ * Literal-args shape for a column definition consumed by `addColumn` and
+ * similar operations. Fully materialized: codec expansion and default
+ * rendering have already happened in the wrapper.
  *
  * - `typeSql` is the column's DDL type string (e.g. `"integer"`, `"SERIAL"`,
  *   `"varchar(100)"`), already produced by `buildColumnTypeSql` in the

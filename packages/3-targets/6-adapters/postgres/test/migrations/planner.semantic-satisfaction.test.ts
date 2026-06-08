@@ -20,9 +20,11 @@ import type { SqlSchemaIR } from '@prisma-next/sql-schema-ir/types';
 import { createPostgresMigrationPlanner } from '@prisma-next/target-postgres/planner';
 import { applicationDomainOf } from '@prisma-next/test-utils';
 import { describe, expect, it } from 'vitest';
+import { createPostgresAdapter } from '../../src/core/adapter';
 
 describe('PostgresMigrationPlanner - semantic satisfaction', () => {
-  const planner = createPostgresMigrationPlanner();
+  const testAdapter = createPostgresAdapter();
+  const planner = createPostgresMigrationPlanner(testAdapter);
 
   describe('unique constraint requirements', () => {
     it('does not emit unique operation when satisfied by unique index', () => {

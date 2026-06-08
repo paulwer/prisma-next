@@ -46,7 +46,7 @@ export function renderCallsToTypeScript(
   meta: RenderMigrationMeta,
 ): string {
   const imports = buildImports(calls);
-  const operationsBody = calls.map((c) => c.renderTypeScript()).join(',\n');
+  const operationsBody = calls.map((c) => renderCall(c)).join(',\n');
 
   return [
     shebangLineFor(detectScaffoldRuntime()),
@@ -64,6 +64,10 @@ export function renderCallsToTypeScript(
     'MigrationCLI.run(import.meta.url, M);',
     '',
   ].join('\n');
+}
+
+function renderCall(call: OpFactoryCall): string {
+  return call.renderTypeScript();
 }
 
 function buildImports(calls: ReadonlyArray<OpFactoryCall>): string {

@@ -32,6 +32,7 @@ Marker/ledger operations are the **first consumer** (proving the surface against
 - **No change to marker/ledger storage shape or wire semantics.** Table layouts (`prisma_contract.marker`/`.ledger`, `_prisma_marker`/`_prisma_ledger`, `_prisma_migrations`), the CAS/advisory-lock strategies (ADR 190/043), and the per-space marker model (ADR 212) are preserved. The one deliberate exception is the invariant-merge convergence (see DoD).
 - **No user-facing runtime DDL authoring surface.** DDL becomes a valid, lowerable query-AST kind, but giving application authors a builder to emit it is deferred. (Modelling DDL as valid now avoids foreclosing it later.)
 - **No runtime query-path changes.** User-facing lanes, codecs, and runtime DML execution are untouched.
+- **Not a complete control-plane stack-lifecycle refactor.** This project routes marker/ledger/DDL operations through `adapter.lower()`, and PR #751 moved the **planner** onto the right ownership shape (`createPlanner` takes the orchestrator-built control adapter; `family.adapter` is gone). But the SQL family still retains a live adapter for its *other* methods, and `PostgresMigration` still builds its own — so a control operation can still hold more than one adapter instance, rather than the orchestrator constructing one and threading it everywhere the way `createExecutionStack` does in the runtime plane. Finishing that (runner bootstrap + `PostgresMigration` + dropping `getControlAdapter`/`lowerAst` from the family) is tracked separately as **TML-2856** (detailed in the plan's parallel-group-B follow-ups).
 
 ## Place in the larger world
 
@@ -67,7 +68,7 @@ Marker/ledger operations are the **first consumer** (proving the surface against
 - [ ] A contract-free construction surface exists **per family** (SQL + Mongo) and is the construction path for in-scope marker/ledger/DDL nodes — no in-scope operation hand-builds nodes by object literal or concatenates raw SQL.
 - [ ] The two `as` casts in Mongo `marker-ledger.ts` are eliminated (cast ratchet not regressed).
 - [ ] Invariant-merge converges on accumulate-dedupe across Postgres **and** SQLite (operator-confirmed); a test pins the merge for both dialects.
-- [ ] The migration planner's DDL builders construct query-AST DDL lowered through the adapter (planner-adoption slice), or the residual is explicitly deferred with a tracked follow-up.
+- [ ] The migration planner adopts the typed AST across **all three targets**, or the residual is explicitly deferred with tracked follow-up slices: the **SQL** planner (Postgres + SQLite) builds query-AST DDL lowered through the adapter, **and the Mongo migration planner** builds the contract-free Mongo command surface (`Create*Command` nodes) lowered through `MongoControlAdapter.lower()` — symmetric to the SQL adoption. Planner-adoption is not SQL-only; the Mongo migration planner still constructs its commands via the migration `*Call` path and must move onto the same adapter-lowering path the marker/ledger slice established.
 - [ ] An ADR records "DDL as a target-contributed query-AST kind + adapter DDL-lowering seam"; affected subsystem docs (Adapters & Targets, Migration System) updated.
 
 ## Open Questions

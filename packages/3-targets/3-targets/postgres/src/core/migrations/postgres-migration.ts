@@ -3,8 +3,11 @@ import type { SqlMigrationPlanOperation } from '@prisma-next/family-sql/control'
 import type { SqlControlAdapter } from '@prisma-next/family-sql/control-adapter';
 import { Migration as SqlMigration } from '@prisma-next/family-sql/migration';
 import type { ControlStack } from '@prisma-next/framework-components/control';
+import { UNBOUND_NAMESPACE_ID } from '@prisma-next/framework-components/ir';
 import type { SqlStorage } from '@prisma-next/sql-contract/types';
+import type { DdlColumn, DdlTableConstraint } from '@prisma-next/sql-relational-core/ast';
 import { errorPostgresMigrationStackMissing } from '../errors';
+import { CreateSchemaCall, CreateTableCall } from './op-factory-call';
 import { type DataTransformOptions, dataTransform } from './operations/data-transform';
 import type { PostgresPlanTargetDetails } from './planner-target-details';
 
@@ -66,5 +69,43 @@ export abstract class PostgresMigration extends SqlMigration<
       throw errorPostgresMigrationStackMissing();
     }
     return dataTransform(contract, name, options, this.controlAdapter);
+  }
+
+  /**
+   * Emit a `CREATE TABLE` migration operation. Builds a typed DDL node from
+   * the supplied options and lowers it through the stored control adapter.
+   * Throws if no adapter is present (i.e. migration instantiated without a stack).
+   */
+  protected createTable(options: {
+    readonly schema?: string;
+    readonly table: string;
+    readonly ifNotExists?: boolean;
+    readonly columns: readonly DdlColumn[];
+    readonly constraints?: readonly DdlTableConstraint[];
+  }): SqlMigrationPlanOperation<PostgresPlanTargetDetails> {
+    if (!this.controlAdapter) {
+      throw errorPostgresMigrationStackMissing();
+    }
+    return new CreateTableCall(
+      options.schema ?? UNBOUND_NAMESPACE_ID,
+      options.table,
+      options.columns,
+      options.constraints,
+    ).toOp(this.controlAdapter);
+  }
+
+  /**
+   * Emit a `CREATE SCHEMA` migration operation. Builds a typed DDL node from
+   * the supplied options and lowers it through the stored control adapter.
+   * Throws if no adapter is present (i.e. migration instantiated without a stack).
+   */
+  protected createSchema(options: {
+    readonly schema: string;
+    readonly ifNotExists?: boolean;
+  }): SqlMigrationPlanOperation<PostgresPlanTargetDetails> {
+    if (!this.controlAdapter) {
+      throw errorPostgresMigrationStackMissing();
+    }
+    return new CreateSchemaCall(options.schema).toOp(this.controlAdapter);
   }
 }

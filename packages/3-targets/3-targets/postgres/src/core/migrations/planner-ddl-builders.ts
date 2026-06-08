@@ -12,7 +12,7 @@ import { resolveColumnTypeMetadata } from './planner-type-resolution';
 export function buildCreateTableSql(
   qualifiedTableName: string,
   table: StorageTable,
-  codecHooks: Map<string, CodecControlHooks>,
+  codecHooks: ReadonlyMap<string, CodecControlHooks>,
   storageTypes: Record<string, StorageTypeInstance | PostgresEnumStorageEntry> = {},
 ): string {
   const columnDefinitions = Object.entries(table.columns).map(
@@ -77,7 +77,7 @@ function assertSafeDefaultExpression(expression: string): void {
  */
 export function buildColumnTypeSql(
   column: StorageColumn,
-  codecHooks: Map<string, CodecControlHooks>,
+  codecHooks: ReadonlyMap<string, CodecControlHooks>,
   storageTypes: Record<string, StorageTypeInstance | PostgresEnumStorageEntry> = {},
   allowPseudoTypes = true,
 ): string {
@@ -113,7 +113,7 @@ export function buildColumnTypeSql(
 
 function expandParameterizedTypeSql(
   column: Pick<StorageColumn, 'nativeType' | 'codecId' | 'typeParams'>,
-  codecHooks: Map<string, CodecControlHooks>,
+  codecHooks: ReadonlyMap<string, CodecControlHooks>,
 ): string | null {
   if (!column.typeParams) {
     return null;
@@ -197,7 +197,7 @@ export function buildAddColumnSql(
   qualifiedTableName: string,
   columnName: string,
   column: StorageColumn,
-  codecHooks: Map<string, CodecControlHooks>,
+  codecHooks: ReadonlyMap<string, CodecControlHooks>,
   temporaryDefault?: string | null,
   storageTypes: Record<string, StorageTypeInstance | PostgresEnumStorageEntry> = {},
 ): string {

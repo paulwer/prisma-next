@@ -15,6 +15,7 @@
  */
 
 import { APP_SPACE_ID } from '@prisma-next/framework-components/control';
+import { col } from '@prisma-next/sql-relational-core/contract-free';
 import {
   AddColumnCall,
   AddEnumValuesCall,
@@ -44,8 +45,10 @@ import { TypeScriptRenderablePostgresMigration } from '@prisma-next/target-postg
 import { renderOps } from '@prisma-next/target-postgres/render-ops';
 import { ifDefined } from '@prisma-next/utils/defined';
 import { describe, expect, it } from 'vitest';
+import { createPostgresAdapter } from '../../src/core/adapter';
 
 const META = { from: 'sha256:from', to: 'sha256:to' } as const;
+const testAdapter = createPostgresAdapter();
 
 describe('renderOps', () => {
   it('lowers each variant via its pure factory, pinning id/operationClass/target.details', () => {
@@ -59,9 +62,7 @@ describe('renderOps', () => {
       postcheck: [],
     };
     const calls = [
-      new CreateTableCall('public', 'user', [
-        { name: 'id', typeSql: 'text', defaultSql: '', nullable: false },
-      ]),
+      new CreateTableCall('public', 'user', [col('id', 'text', { notNull: true })]),
       new DropTableCall('public', 'stale'),
       new AddColumnCall('public', 'user', {
         name: 'email',
@@ -100,7 +101,7 @@ describe('renderOps', () => {
       new CreateSchemaCall('app'),
     ];
 
-    const ops = renderOps(calls);
+    const ops = renderOps(calls, testAdapter);
 
     const schemaObject = (objectType: string, name: string, table?: string) => ({
       schema: 'public',

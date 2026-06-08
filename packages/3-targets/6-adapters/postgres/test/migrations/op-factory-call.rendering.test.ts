@@ -14,6 +14,7 @@
  * op-factory-call.lowering.test.ts.
  */
 
+import { col, lit, primaryKey } from '@prisma-next/sql-relational-core/contract-free';
 import {
   AddColumnCall,
   AddEnumValuesCall,
@@ -113,24 +114,53 @@ describe('Postgres call classes - per-class renderTypeScript coverage', () => {
     expect(call.importRequirements()).toEqual([{ moduleSpecifier: migrationModule, symbol }]);
   };
 
-  it('CreateTableCall emits columns as an array literal; omits the primary-key arg when absent', () => {
-    const withoutPk = new CreateTableCall('public', 'user', [
-      { name: 'id', typeSql: 'text', defaultSql: '', nullable: false },
+  it('CreateTableCall emits this.createTable({...}) with col() columns; omits constraints when absent', () => {
+    const withoutConstraints = new CreateTableCall('public', 'user', [
+      col('id', 'text', { notNull: true }),
     ]);
-    expect(withoutPk.renderTypeScript()).toBe(
-      'createTable("public", "user", [{ name: "id", typeSql: "text", defaultSql: "", nullable: false }])',
+    expect(withoutConstraints.renderTypeScript()).toBe(
+      'this.createTable({ schema: "public", table: "user", columns: [col("id", "text", { notNull: true })] })',
     );
-    expectFactoryImport(withoutPk, 'createTable');
+    expect(withoutConstraints.importRequirements()).toEqual([
+      { moduleSpecifier: '@prisma-next/sql-relational-core/contract-free', symbol: 'col' },
+    ]);
 
     const withPk = new CreateTableCall(
       'public',
       'user',
-      [{ name: 'id', typeSql: 'text', defaultSql: '', nullable: false }],
-      { columns: ['id'] },
+      [col('id', 'text', { notNull: true })],
+      [primaryKey(['id'])],
     );
     expect(withPk.renderTypeScript()).toBe(
-      'createTable("public", "user", [{ name: "id", typeSql: "text", defaultSql: "", nullable: false }], { columns: ["id"] })',
+      'this.createTable({ schema: "public", table: "user", columns: [col("id", "text", { notNull: true })], constraints: [primaryKey(["id"])] })',
     );
+    expect(withPk.importRequirements()).toEqual([
+      { moduleSpecifier: '@prisma-next/sql-relational-core/contract-free', symbol: 'col' },
+      { moduleSpecifier: '@prisma-next/sql-relational-core/contract-free', symbol: 'primaryKey' },
+    ]);
+  });
+
+  it('CreateTableCall omits schema option when schema is __unbound__', () => {
+    const call = new CreateTableCall('__unbound__', 'item', [col('id', 'text', { notNull: true })]);
+    expect(call.renderTypeScript()).toBe(
+      'this.createTable({ table: "item", columns: [col("id", "text", { notNull: true })] })',
+    );
+  });
+
+  it('CreateTableCall includes lit() and fn() imports when columns have defaults', () => {
+    const call = new CreateTableCall('public', 'user', [
+      col('id', 'integer', { notNull: true, default: lit(0) }),
+    ]);
+    expect(call.importRequirements()).toEqual([
+      { moduleSpecifier: '@prisma-next/sql-relational-core/contract-free', symbol: 'col' },
+      { moduleSpecifier: '@prisma-next/sql-relational-core/contract-free', symbol: 'lit' },
+    ]);
+  });
+
+  it('CreateSchemaCall emits this.createSchema({schema}) and contributes no imports', () => {
+    const schema = new CreateSchemaCall('app');
+    expect(schema.renderTypeScript()).toBe('this.createSchema({ schema: "app" })');
+    expect(schema.importRequirements()).toEqual([]);
   });
 
   it('AddColumnCall emits the column literal and imports addColumn', () => {
@@ -281,14 +311,10 @@ describe('Postgres call classes - per-class renderTypeScript coverage', () => {
     expect(prechecks[1]).toContain('NOT EXISTS (');
   });
 
-  it('CreateExtensionCall / CreateSchemaCall emit a single-arg factory call', () => {
+  it('CreateExtensionCall emits a single-arg factory call', () => {
     const ext = new CreateExtensionCall('citext');
     expect(ext.renderTypeScript()).toBe('createExtension("citext")');
     expectFactoryImport(ext, 'createExtension');
-
-    const schema = new CreateSchemaCall('app');
-    expect(schema.renderTypeScript()).toBe('createSchema("app")');
-    expectFactoryImport(schema, 'createSchema');
   });
 
   it('RawSqlCall serializes the stored op as a JSON literal and imports rawSql', () => {
@@ -330,9 +356,7 @@ describe('Postgres call classes - per-class renderTypeScript coverage', () => {
 describe('renderCallsToTypeScript', () => {
   it('deduplicates + sorts imports across a mixed call list and keeps the base Migration import', () => {
     const calls = [
-      new CreateTableCall('public', 'user', [
-        { name: 'id', typeSql: 'text', defaultSql: '', nullable: false },
-      ]),
+      new CreateTableCall('public', 'user', [col('id', 'text', { notNull: true })]),
       new DropTableCall('public', 'old_user'),
       new AddColumnCall('public', 'user', {
         name: 'email',
@@ -345,18 +369,17 @@ describe('renderCallsToTypeScript', () => {
 
     const source = renderCallsToTypeScript(calls, META);
 
-    // `Migration` is now re-exported from the target's migration entrypoint, so
-    // it gets merged into the same aggregated import line as the per-factory
-    // imports (see `buildImportClause` in `@prisma-next/ts-render`). Asserted
-    // as an exact-length array so a stray duplicate import line fails here.
+    // CreateTableCall now uses this.createTable (a method), so createTable is
+    // no longer imported from the migration module. The import line contains only
+    // the factories actually used as free functions.
     const targetPostgresImports = source
       .split('\n')
       .filter((line) => line.includes("from '@prisma-next/postgres/migration';"));
     expect(targetPostgresImports).toEqual([
-      "import { Migration, MigrationCLI, addColumn, createIndex, createTable, dropTable } from '@prisma-next/postgres/migration';",
+      "import { Migration, MigrationCLI, addColumn, createIndex, dropTable } from '@prisma-next/postgres/migration';",
     ]);
-    // Each call appears once in the operations body.
-    expect(source).toContain('createTable(');
+    // CreateTableCall emits as this.createTable(...) (method call), not free function.
+    expect(source).toContain('this.createTable(');
     expect(source).toContain('dropTable(');
     expect(source).toContain('addColumn(');
     expect(source).toContain('createIndex(');
@@ -397,5 +420,29 @@ describe('renderCallsToTypeScript', () => {
       "import { Migration, MigrationCLI } from '@prisma-next/postgres/migration';",
     );
     expect(source).toContain('MigrationCLI.run(import.meta.url, M);');
+  });
+
+  it('renders CreateTableCall as this.createTable({...}) with col() columns in the scaffold', () => {
+    const calls = [
+      new CreateTableCall('public', 'bug', [
+        col('severity', 'text', { notNull: true }),
+        col('stepsToRepro', 'text'),
+      ]),
+      new CreateTableCall(
+        'public',
+        'item',
+        [col('tenant_id', 'uuid', { notNull: true }), col('id', 'uuid', { notNull: true })],
+        [primaryKey(['tenant_id', 'id'])],
+      ),
+    ];
+    const source = renderCallsToTypeScript(calls, META);
+    // The scaffold must emit the method form with contract-free col() builders.
+    expect(source).toContain('this.createTable({');
+    expect(source).toContain('col("severity", "text"');
+    expect(source).toContain('col("stepsToRepro", "text")');
+    expect(source).toContain('col("tenant_id", "uuid"');
+    expect(source).toContain('primaryKey(["tenant_id", "id"])');
+    // Must not embed a raw SQL string.
+    expect(source).not.toMatch(/this\.createTable\(.*CREATE TABLE/s);
   });
 });

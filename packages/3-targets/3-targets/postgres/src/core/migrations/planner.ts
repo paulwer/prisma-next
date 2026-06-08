@@ -12,6 +12,7 @@ import {
   planFieldEventOperations,
   plannerFailure,
 } from '@prisma-next/family-sql/control';
+import type { Lowerer } from '@prisma-next/family-sql/control-adapter';
 import { verifySqlSchema } from '@prisma-next/family-sql/schema-verify';
 import type { TargetBoundComponentDescriptor } from '@prisma-next/framework-components/components';
 import type {
@@ -51,8 +52,8 @@ type VerifySqlSchemaOptionsWithComponents = Parameters<typeof verifySqlSchema>[0
   readonly frameworkComponents: PlannerFrameworkComponents;
 };
 
-export function createPostgresMigrationPlanner(): PostgresMigrationPlanner {
-  return new PostgresMigrationPlanner();
+export function createPostgresMigrationPlanner(lowerer: Lowerer): PostgresMigrationPlanner {
+  return new PostgresMigrationPlanner(lowerer);
 }
 
 /**
@@ -87,6 +88,12 @@ export type PostgresPlanResult =
  * authoring surface.
  */
 export class PostgresMigrationPlanner implements MigrationPlanner<'sql', 'postgres'> {
+  readonly #lowerer: Lowerer | undefined;
+
+  constructor(lowerer?: Lowerer) {
+    this.#lowerer = lowerer;
+  }
+
   plan(options: {
     readonly contract: unknown;
     readonly schema: unknown;
@@ -129,6 +136,7 @@ export class PostgresMigrationPlanner implements MigrationPlanner<'sql', 'postgr
         to: context.toHash,
       },
       spaceId,
+      this.#lowerer,
     );
   }
 
@@ -225,6 +233,7 @@ export class PostgresMigrationPlanner implements MigrationPlanner<'sql', 'postgr
           to: options.contract.storage.storageHash,
         },
         options.spaceId,
+        this.#lowerer,
       ),
       ...(warnings.length > 0 ? { warnings: Object.freeze(warnings) } : {}),
     });
