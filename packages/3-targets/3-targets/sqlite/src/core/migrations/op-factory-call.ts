@@ -14,7 +14,7 @@ import type {
   MigrationOperationClass,
   SqlMigrationPlanOperation,
 } from '@prisma-next/family-sql/control';
-import type { Lowerer } from '@prisma-next/family-sql/control-adapter';
+import type { ExecuteRequestLowerer, Lowerer } from '@prisma-next/family-sql/control-adapter';
 import type { OpFactoryCall as FrameworkOpFactoryCall } from '@prisma-next/framework-components/control';
 import type {
   AnyDdlColumnDefault,
@@ -22,6 +22,7 @@ import type {
   DdlTableConstraint,
 } from '@prisma-next/sql-relational-core/ast';
 import { type ImportRequirement, jsonToTsSource, TsExpression } from '@prisma-next/ts-render';
+import { ifDefined } from '@prisma-next/utils/defined';
 import * as contractFreeDdl from '../../contract-free/ddl';
 import { escapeLiteral } from '../sql-utils';
 import { addColumn, dropColumn } from './operations/columns';
@@ -40,7 +41,7 @@ abstract class SqliteOpFactoryCallNode extends TsExpression implements Framework
   abstract readonly factoryName: string;
   abstract readonly operationClass: MigrationOperationClass;
   abstract readonly label: string;
-  abstract toOp(lowerer?: Lowerer): Op;
+  abstract toOp(lowerer?: Lowerer): Op | Promise<Op>;
 
   importRequirements(): readonly ImportRequirement[] {
     return [{ moduleSpecifier: TARGET_MIGRATION_MODULE, symbol: this.factoryName }];
@@ -138,7 +139,7 @@ export class CreateTableCall extends SqliteOpFactoryCallNode {
     this.freeze();
   }
 
-  toOp(lowerer?: Lowerer): Op {
+  async toOp(lowerer?: ExecuteRequestLowerer): Promise<Op> {
     if (lowerer === undefined) {
       throw new Error(
         `CreateTableCall.toOp: a DDL lowerer is required on the SQLite planner path (table "${this.tableName}"). Pass the control adapter to createSqliteMigrationPlanner.`,
@@ -147,9 +148,9 @@ export class CreateTableCall extends SqliteOpFactoryCallNode {
     const ddlNode = contractFreeDdl.createTable({
       table: this.tableName,
       columns: this.columns,
-      ...(this.constraints ? { constraints: this.constraints } : {}),
+      ...ifDefined('constraints', this.constraints),
     });
-    const { sql } = lowerer.lower(ddlNode, { contract: {} });
+    const statement = await lowerer.lowerToExecuteRequest(ddlNode);
     const tableName = this.tableName;
     const escapedName = escapeLiteral(tableName);
     return {
@@ -164,7 +165,13 @@ export class CreateTableCall extends SqliteOpFactoryCallNode {
           `SELECT COUNT(*) = 0 FROM sqlite_master WHERE type = 'table' AND name = '${escapedName}'`,
         ),
       ],
-      execute: [step(`create table "${tableName}"`, sql)],
+      execute: [
+        {
+          description: `create table "${tableName}"`,
+          sql: statement.sql,
+          params: statement.params ?? [],
+        },
+      ],
       postcheck: [
         step(
           `verify table "${tableName}" exists`,

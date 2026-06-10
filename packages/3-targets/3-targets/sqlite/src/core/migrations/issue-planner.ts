@@ -8,7 +8,7 @@
  * remaining issues flow through `mapIssueToCall` for the default case.
  */
 
-import type { Contract } from '@prisma-next/contract/types';
+import type { Contract, JsonValue } from '@prisma-next/contract/types';
 import type {
   CodecControlHooks,
   MigrationOperationPolicy,
@@ -24,7 +24,7 @@ import type {
   StorageTable,
   StorageTypeInstance,
 } from '@prisma-next/sql-contract/types';
-import type { DdlTableConstraint } from '@prisma-next/sql-relational-core/ast';
+import type { CodecRef, DdlTableConstraint } from '@prisma-next/sql-relational-core/ast';
 import {
   DdlColumn,
   ForeignKeyConstraint,
@@ -59,6 +59,7 @@ import {
   buildColumnDefaultSql,
   buildColumnTypeSql,
   isInlineAutoincrementPrimaryKey,
+  resolveColumnTypeMetadata,
 } from './planner-ddl-builders';
 import {
   type CallMigrationStrategy,
@@ -222,7 +223,10 @@ export function toColumnSpec(
 ): SqliteColumnSpec {
   const typeSql = buildColumnTypeSql(
     column,
-    storageTypes as Record<string, StorageTypeInstance | PostgresEnumStorageEntry>,
+    blindCast<
+      Record<string, StorageTypeInstance | PostgresEnumStorageEntry>,
+      'buildColumnTypeSql declares its storageTypes parameter as mutable Record while the planner stores it readonly; the helper does not mutate, so the readonly→mutable narrowing is sound'
+    >(storageTypes),
   );
   const defaultSql = buildColumnDefaultSql(column.default);
   return {
@@ -305,7 +309,14 @@ export function tableToDdlParts(
 ): { columns: DdlColumn[]; constraints: DdlTableConstraint[] } {
   const columns: DdlColumn[] = Object.entries(table.columns).map(([name, column]) => {
     const inlineAutoincrement = isInlineAutoincrementPrimaryKey(table, name);
-    const typeSql = buildColumnTypeSql(column, storageTypes);
+    const typeSql = buildColumnTypeSql(
+      column,
+      blindCast<
+        Record<string, StorageTypeInstance | PostgresEnumStorageEntry>,
+        'buildColumnTypeSql declares its storageTypes parameter as mutable Record while the planner stores it readonly; the helper does not mutate, so the readonly→mutable narrowing is sound'
+      >(storageTypes),
+    );
+
     if (inlineAutoincrement) {
       // `DdlColumn` has no SQLite-specific autoincrement flag, so the full
       // `PRIMARY KEY AUTOINCREMENT` clause is embedded in the `type` string.
@@ -316,11 +327,32 @@ export function tableToDdlParts(
       return new DdlColumn({ name, type: `${typeSql} PRIMARY KEY AUTOINCREMENT` });
     }
     const colDefault = sqliteDefaultToDdlColumnDefault(column.default);
+    const resolved = resolveColumnTypeMetadata(
+      column,
+      blindCast<
+        Record<string, StorageTypeInstance | PostgresEnumStorageEntry>,
+        'resolveColumnTypeMetadata declares its storageTypes parameter as mutable Record while the planner stores it readonly; the helper does not mutate, so the readonly→mutable narrowing is sound'
+      >(storageTypes),
+    );
+    const codecRef: CodecRef | undefined = resolved.codecId
+      ? {
+          codecId: resolved.codecId,
+          ...(resolved.typeParams !== undefined
+            ? {
+                typeParams: blindCast<
+                  JsonValue,
+                  'resolved.typeParams is JsonValue-shaped storage metadata; the narrowed (non-undefined) value lands in CodecRef.typeParams which is JsonValue'
+                >(resolved.typeParams),
+              }
+            : {}),
+        }
+      : undefined;
     return new DdlColumn({
       name,
       type: typeSql,
       ...(!column.nullable ? { notNull: true } : {}),
       ...(colDefault !== undefined ? { default: colDefault } : {}),
+      ...(codecRef !== undefined ? { codecRef } : {}),
     });
   });
 
