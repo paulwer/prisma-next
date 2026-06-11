@@ -2,14 +2,15 @@ import type { ContractMarkerRecord, LedgerEntryRecord } from '@prisma-next/contr
 import { parseMarkerRowSafely, withMarkerReadErrorHandling } from '@prisma-next/errors/execution';
 import type { SqlControlAdapter } from '@prisma-next/family-sql/control-adapter';
 import { parseContractMarkerRow } from '@prisma-next/family-sql/verify';
-import type { CodecLookup } from '@prisma-next/framework-components/codec';
-import { APP_SPACE_ID, extractCodecLookup } from '@prisma-next/framework-components/control';
+import type { CodecLookup, CodecRegistry } from '@prisma-next/framework-components/codec';
+import { APP_SPACE_ID } from '@prisma-next/framework-components/control';
 import { ledgerOriginFromStored } from '@prisma-next/migration-tools/ledger-origin';
 import { REFERENTIAL_ACTION_SQL } from '@prisma-next/sql-contract/referential-action-sql';
 import type { SqlControlDriverInstance } from '@prisma-next/sql-contract/types';
 import type {
   AnyQueryAst,
   CodecRef,
+  ContractCodecRegistry,
   DdlColumn,
   DdlNode,
   DdlTableConstraint,
@@ -31,7 +32,6 @@ import type {
   SqlTableIR,
   SqlUniqueIR,
 } from '@prisma-next/sql-schema-ir/types';
-import { sqliteCodecRegistry } from '@prisma-next/target-sqlite/codecs';
 import {
   buildControlTableBootstrapQueries,
   buildSignMarkerBootstrapQueries,
@@ -112,28 +112,14 @@ type FkAccumulator = {
   onUpdate: string;
 };
 
-function createSqliteBuiltinCodecLookup(): CodecLookup {
-  return extractCodecLookup([
-    {
-      id: 'sqlite-builtin-codecs',
-      types: { codecTypes: { codecDescriptors: Array.from(sqliteCodecRegistry.values()) } },
-    },
-  ]);
-}
-
 export class SqliteControlAdapter implements SqlControlAdapter<'sqlite'> {
   readonly familyId = 'sql' as const;
   readonly targetId = 'sqlite' as const;
 
-  private readonly codecLookup: CodecLookup;
+  private readonly codecRegistry: CodecRegistry;
 
-  /**
-   * @param codecLookup - Codec lookup used to resolve codecs for DDL literal-default encoding.
-   *   Defaults to a SQLite-builtins-only lookup when omitted. Stack-aware callers supply
-   *   `stack.codecLookup` so extension codecs are visible to the DDL walker.
-   */
-  constructor(codecLookup?: CodecLookup) {
-    this.codecLookup = codecLookup ?? createSqliteBuiltinCodecLookup();
+  constructor(codecRegistry: CodecRegistry) {
+    this.codecRegistry = codecRegistry;
   }
 
   readonly normalizeDefault = parseSqliteDefault;
@@ -161,7 +147,10 @@ export class SqliteControlAdapter implements SqlControlAdapter<'sqlite'> {
         'lower() cannot lower DDL: DDL default literals require inline codec encoding, which is async. Use lowerToExecuteRequest().',
       );
     }
-    return renderLoweredSql(ast, context.contract as SqliteContract);
+    return renderLoweredSql(
+      ast,
+      blindCast<SqliteContract, 'caller must supply a matching SqliteContract'>(context.contract),
+    );
   }
 
   /**
@@ -178,14 +167,18 @@ export class SqliteControlAdapter implements SqlControlAdapter<'sqlite'> {
     if (isDdlNode(ast)) {
       return sqliteRenderDdlExecuteRequest(
         blindCast<SqliteDdlNode, 'isDdlNode guard'>(ast),
-        this.codecLookup,
+        this.codecRegistry,
       );
     }
-    const lowered = renderLoweredSql(
-      ast,
-      blindCast<SqliteContract, 'Caller must supply matching contract'>(context?.contract),
+    const contract = blindCast<SqliteContract, 'Caller must supply matching contract'>(
+      context?.contract,
     );
-    const params = await encodeControlQueryParams(lowered, ast);
+    const lowered = renderLoweredSql(ast, contract);
+    const codecRegistry = blindCast<
+      ContractCodecRegistry,
+      'framework CodecRegistry: its descriptors materialise SQL codecs; the framework Codec type erases to BaseCodec at this boundary'
+    >(this.codecRegistry);
+    const params = await encodeControlQueryParams(lowered, ast, codecRegistry);
     return { sql: lowered.sql, params };
   }
 

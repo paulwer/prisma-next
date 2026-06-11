@@ -10,7 +10,7 @@ import {
 } from '@prisma-next/errors/execution';
 import type { SqlControlAdapter } from '@prisma-next/family-sql/control-adapter';
 import { parseContractMarkerRow } from '@prisma-next/family-sql/verify';
-import type { CodecLookup } from '@prisma-next/framework-components/codec';
+import type { CodecLookup, CodecRegistry } from '@prisma-next/framework-components/codec';
 import { APP_SPACE_ID } from '@prisma-next/framework-components/control';
 import { UNBOUND_NAMESPACE_ID } from '@prisma-next/framework-components/ir';
 import { ledgerOriginFromStored } from '@prisma-next/migration-tools/ledger-origin';
@@ -23,6 +23,7 @@ import type {
 import type {
   AnyQueryAst,
   CodecRef,
+  ContractCodecRegistry,
   DdlColumn,
   DdlNode,
   DdlTableConstraint,
@@ -64,7 +65,6 @@ import { normalizeSchemaNativeType } from '@prisma-next/target-postgres/native-t
 import { escapeLiteral, quoteIdentifier } from '@prisma-next/target-postgres/sql-utils';
 import { blindCast } from '@prisma-next/utils/casts';
 import { ifDefined } from '@prisma-next/utils/defined';
-import { createPostgresBuiltinCodecLookup } from './codec-lookup';
 import { encodeControlQueryParams } from './control-codecs';
 import {
   introspectPostgresEnumTypes,
@@ -103,17 +103,10 @@ export class PostgresControlAdapter implements SqlControlAdapter<'postgres'> {
   readonly familyId = 'sql' as const;
   readonly targetId = 'postgres' as const;
 
-  private readonly codecLookup: CodecLookup;
+  private readonly codecRegistry: CodecRegistry;
 
-  /**
-   * @param codecLookup - Codec lookup used by the SQL renderer to resolve
-   *   per-codec metadata at lower-time. Defaults to a Postgres-builtins-only
-   *   lookup when omitted. Stack-aware callers
-   *   (`SqlControlAdapterDescriptor.create(stack)`) supply
-   *   `stack.codecLookup` so extension codecs are visible to the renderer.
-   */
-  constructor(codecLookup?: CodecLookup) {
-    this.codecLookup = codecLookup ?? createPostgresBuiltinCodecLookup();
+  constructor(codecRegistry: CodecRegistry) {
+    this.codecRegistry = codecRegistry;
   }
 
   /**
@@ -172,7 +165,13 @@ export class PostgresControlAdapter implements SqlControlAdapter<'postgres'> {
         'lower() cannot lower DDL: DDL default literals require inline codec encoding, which is async. Use lowerToExecuteRequest().',
       );
     }
-    return renderLoweredSql(ast, context.contract as PostgresContract, this.codecLookup);
+    return renderLoweredSql(
+      ast,
+      blindCast<PostgresContract, 'caller must supply a matching PostgresContract'>(
+        context.contract,
+      ),
+      this.codecRegistry,
+    );
   }
 
   /**
@@ -189,15 +188,18 @@ export class PostgresControlAdapter implements SqlControlAdapter<'postgres'> {
     if (isDdlNode(ast)) {
       return pgRenderDdlExecuteRequest(
         blindCast<PostgresDdlNode, 'isDdlNode guard'>(ast),
-        this.codecLookup,
+        this.codecRegistry,
       );
     }
-    const lowered = renderLoweredSql(
-      ast,
-      blindCast<PostgresContract, 'Caller must supply matching contract'>(context?.contract),
-      this.codecLookup,
+    const contract = blindCast<PostgresContract, 'Caller must supply matching contract'>(
+      context?.contract,
     );
-    const params = await encodeControlQueryParams(lowered, ast);
+    const lowered = renderLoweredSql(ast, contract, this.codecRegistry);
+    const codecRegistry = blindCast<
+      ContractCodecRegistry,
+      'framework CodecRegistry: its descriptors materialise SQL codecs; the framework Codec type erases to BaseCodec at this boundary'
+    >(this.codecRegistry);
+    const params = await encodeControlQueryParams(lowered, ast, codecRegistry);
     return { sql: lowered.sql, params };
   }
 
