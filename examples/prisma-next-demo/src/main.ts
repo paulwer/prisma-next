@@ -106,11 +106,7 @@ import { crossAuthorSimilarity } from './queries/cross-author-similarity';
 import { deleteWithoutWhere } from './queries/delete-without-where';
 import { enumDefaultDemo } from './queries/enum-default-demo';
 import { getAllPostsUnbounded } from './queries/get-all-posts-unbounded';
-import {
-  getPostsByPriority,
-  getPostsByPriorityMember,
-  getPriorityEnumFromEmit,
-} from './queries/get-posts-by-priority';
+import { getPostsByPriority, getPostsByPriorityMember } from './queries/get-posts-by-priority';
 import { getUserByEmailPrepared } from './queries/get-user-by-email-prepared';
 import { getUserById } from './queries/get-user-by-id';
 import { getUserPosts } from './queries/get-user-posts';
@@ -501,7 +497,7 @@ async function main() {
       }
     } else if (cmd === 'enum-priority') {
       const limit = args[0] ? Number.parseInt(args[0], 10) : 10;
-      const priority = getPriorityEnumFromEmit();
+      const priority = db.enums.public.Priority;
 
       console.log('Priority enum values (declaration order):', priority.values);
       console.log('Priority enum members:', priority.members);
@@ -512,15 +508,15 @@ async function main() {
     } else if (cmd === 'enum-priority-filter') {
       const [memberName, limitStr] = args;
       const limit = limitStr ? Number.parseInt(limitStr, 10) : 10;
-      const priorityEnum = getPriorityEnumFromEmit();
+      const priority = db.enums.public.Priority;
       const requested = memberName ?? 'Low';
-      if (!priorityEnum.names.includes(requested)) {
+      if (!priority.hasName(requested)) {
         console.error(
-          `Unknown Priority member "${requested}" — expected one of: ${priorityEnum.names.join(', ')}`,
+          `Unknown Priority member "${requested}" — expected one of: ${Object.keys(priority.members).join(', ')}`,
         );
         process.exit(1);
       }
-      const posts = await getPostsByPriorityMember(requested, limit);
+      const posts = await getPostsByPriorityMember(priority.members[requested], limit);
       console.log(`Posts with priority=${requested} (${posts.length} rows):`);
       console.log(JSON.stringify(posts, null, 2));
     } else if (cmd === 'enum-default-demo') {
